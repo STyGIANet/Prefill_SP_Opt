@@ -132,7 +132,7 @@ and a workload SHA-256 digest.
 
 For offered input load $\rho$ in tokens/s and mean prompt length $\bar L$, the
 Poisson request rate is $\lambda=\rho/\bar L$. Interarrival times are sampled from
-$\operatorname{Exponential}(\lambda)$ using `--arrival-seed`. Offered token load
+$\text{Exponential}(\lambda)$ using `--arrival-seed`. Offered token load
 measures input demand, not GPU utilization; attention cost also depends on
 prompt length. `--arrival-pattern burst` places all arrivals at time zero.
 
