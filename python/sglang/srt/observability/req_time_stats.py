@@ -677,7 +677,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
         if not (self.enable_metrics or self.has_timing_data):
-            return {}
+            # Preserve the first-token boundary without enabling full metrics.
+            # The receiver rebases it to its monotonic clock as for other times.
+            return {
+                "prefill_finished_time": self.prefill_finished_time,
+                "diff_realtime_monotonic": global_diff_realtime_monotonic,
+            }
 
         state = {
             "has_timing_data": True,

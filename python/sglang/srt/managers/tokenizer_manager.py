@@ -2524,6 +2524,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "num_retractions": recv_obj.retraction_counts[i],
             }
 
+            if isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput)):
+                ready_time = self._get_scheduler_first_token_time(state, recv_obj, i)
+                if ready_time is not None:
+                    meta_info["first_token_ready_time"] = ready_time
+
             if self.enable_metrics:
                 if recv_obj.time_stats is not None:
                     scheduler_time_stats = recv_obj.time_stats[i]
