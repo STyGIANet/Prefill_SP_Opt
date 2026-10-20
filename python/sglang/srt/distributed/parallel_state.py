@@ -2565,6 +2565,7 @@ def initialize_model_parallel(
     recovered_rank: bool = False,
     rank_offset: int = 0,
     max_world_size: Optional[int] = None,
+    replicated_model_count: int = 1,
 ) -> None:
     """
     Initialize model parallel groups at the published widths.
@@ -2631,6 +2632,19 @@ def initialize_model_parallel(
     decode_context_parallel_size = parallel.attn_dcp_size
     shared_experts_tensor_parallel_size = parallel.shared_experts_tp_size
 
+    # Dynamic SP keeps a complete TP1/PP1 model on each worker. The world
+    # remains shared for token/KV transport; model collectives are singleton
+    # groups. This does not change ordinary serving topology.
+    if type(replicated_model_count) is not int or replicated_model_count < 1:
+        raise ValueError("replicated_model_count must be a positive integer")
+    if replicated_model_count > 1 and (
+        tensor_model_parallel_size != 1
+        or pipeline_model_parallel_size != 1
+        or recovered_rank
+        or rank_offset != 0
+    ):
+        raise ValueError("Replicated models require TP1/PP1 and no elastic rank offset")
+
     # Joiners construct their local TP/PP layout in global rank space.
     world_size: int = (
         tensor_model_parallel_size * pipeline_model_parallel_size
@@ -2638,11 +2652,17 @@ def initialize_model_parallel(
         else torch.distributed.get_world_size()
     )
 
-    if world_size != tensor_model_parallel_size * pipeline_model_parallel_size:
+    expected_world_size = (
+        tensor_model_parallel_size
+        * pipeline_model_parallel_size
+        * replicated_model_count
+    )
+    if world_size != expected_world_size:
         raise RuntimeError(
             f"world_size ({world_size}) is not equal to "
             f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
-            f"pipeline_model_parallel_size ({pipeline_model_parallel_size})"
+            f"pipeline_model_parallel_size ({pipeline_model_parallel_size}) x "
+            f"replicated_model_count ({replicated_model_count})"
         )
     if decode_context_parallel_size < 1:
         raise RuntimeError(
