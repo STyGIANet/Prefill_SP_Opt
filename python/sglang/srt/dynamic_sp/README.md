@@ -21,7 +21,7 @@ For an ordered worker set $R=(r_0,\ldots,r_{d-1})$, the SP degree is $d$ and the
 owner of absolute token position $p$ is
 
 $$
-\operatorname{owner}(p)=r_{p\bmod d}.
+\text{owner}(p)=r_{p\bmod d}.
 $$
 
 Any nonempty ordered subset of workers is permitted. The degree need not divide
