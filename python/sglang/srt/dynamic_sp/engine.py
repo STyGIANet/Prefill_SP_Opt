@@ -1,0 +1,660 @@
+# Copyright 2026 SGLang Team
+# SPDX-License-Identifier: Apache-2.0
+"""Collective, transactional execution of per-prompt SP placement plans.
+
+One caller per worker enters execute(); only worker zero supplies a plan.
+All communication uses a fixed world communicator, avoiding collective group
+creation on the scheduling path. Only designated owners compute tokens and
+retain KV. Nonowners participate in control and layer KV communication.
+
+Plans commit after every requested prefill and migration has succeeded. Old
+KV remains live until commit, so recoverable validation/allocation/model
+errors leave the previous version intact. A transport failure is fail-stop:
+the process group must be restarted, not reused.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import time
+from dataclasses import dataclass
+from typing import Protocol
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from sglang.srt.dynamic_sp.attention import AttentionAccumulator
+from sglang.srt.dynamic_sp.plan import (
+    PrefillPlan,
+    Prompt,
+    local_positions,
+    validate_ranks,
+)
+
+
+class PrefillModel(Protocol):
+    device: torch.device
+    dtype: torch.dtype
+    num_layers: int
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int
+    vocab_size: int
+    context_length: int
+
+    def embed(self, ids: torch.Tensor) -> torch.Tensor: ...
+
+    def prepare(self, layer: int, x: torch.Tensor, positions: torch.Tensor): ...
+
+    def complete(self, layer: int, residual: torch.Tensor, attention: torch.Tensor): ...
+
+    def logits(self, x: torch.Tensor) -> torch.Tensor: ...
+
+
+@dataclass
+class _State:
+    prompt: Prompt
+    ranks: tuple[int, ...]
+    end: int
+    kv: torch.Tensor  # [local_tokens, layers, 2, kv_heads, head_dim]
+
+
+class PlanRejected(RuntimeError):
+    """Every worker rejected the same operation; committed state is unchanged."""
+
+
+class DynamicSPPrefillEngine:
+    def __init__(
+        self,
+        model: PrefillModel,
+        *,
+        control_group,
+        max_local_tokens: int,
+        kv_block_size: int = 256,
+        query_block_size: int = 128,
+        attention_backend: str = "gathered",
+    ):
+        if not dist.is_initialized():
+            raise RuntimeError("Initialize torch.distributed before the SP engine")
+        self.rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
+        if dist.get_world_size(control_group) != self.world_size:
+            raise ValueError("Control group must contain every world rank")
+        self.control_group = control_group
+        self.model = model
+        self.max_local_tokens = max_local_tokens
+        self.kv_block_size = kv_block_size
+        self.query_block_size = query_block_size
+        self.attention_backend = attention_backend
+        self.metrics = {}
+        self._status = torch.zeros(2, dtype=torch.int32, device="cpu")
+        self.version = 0
+        self._states: dict[str, _State] = {}
+        self._failed = False
+        self._busy = False
+        self._checked("configuration", self._validate_configuration)
+        self._agree(
+            (
+                model.num_layers,
+                model.num_heads,
+                model.num_kv_heads,
+                model.head_dim,
+                model.vocab_size,
+                model.context_length,
+                str(model.dtype),
+                max_local_tokens,
+                kv_block_size,
+                query_block_size,
+                attention_backend,
+            ),
+            "Worker model/configuration mismatch",
+        )
+
+    def _validate_configuration(self):
+        m = self.model
+        if self.attention_backend not in ("gathered", "streaming"):
+            raise ValueError("attention_backend must be gathered or streaming")
+        for value in (
+            self.max_local_tokens,
+            self.kv_block_size,
+            self.query_block_size,
+            m.num_layers,
+            m.num_heads,
+            m.num_kv_heads,
+            m.head_dim,
+            m.vocab_size,
+            m.context_length,
+        ):
+            if type(value) is not int or value <= 0:
+                raise ValueError(
+                    "Dimensions, block sizes and capacity must be positive ints"
+                )
+        if m.num_heads % m.num_kv_heads:
+            raise ValueError("Query head count must be divisible by KV head count")
+
+    def _all_objects(self, value):
+        results = [None] * self.world_size
+        dist.all_gather_object(results, value, group=self.control_group)
+        return results
+
+    def _agree(self, value, message):
+        values = self._all_objects(value)
+        if any(v != values[0] for v in values):
+            raise PlanRejected(message)
+
+    def _checked(self, label, fn):
+        started = time.perf_counter()
+        self.metrics["checked_phases"] = self.metrics.get("checked_phases", 0) + 1
+        result, error, fatal = None, None, False
+        try:
+            result = fn()
+            if self.model.device.type == "cuda":
+                torch.cuda.synchronize(self.model.device)
+        except Exception as exc:  # noqa: BLE001 - every local failure needs consensus
+            error = f"rank {self.rank}: {type(exc).__name__}: {exc}"
+            # An asynchronous CUDA execution error can invalidate the context.
+            # Allocation exhaustion is recoverable; a device-side fault is not.
+            fatal = (
+                self.model.device.type == "cuda"
+                and isinstance(exc, RuntimeError)
+                and not isinstance(exc, torch.OutOfMemoryError)
+                and ("CUDA error" in str(exc) or "device-side assert" in str(exc))
+            )
+        self.metrics["local_work_and_device_wait_seconds"] = (
+            self.metrics.get("local_work_and_device_wait_seconds", 0.0)
+            + time.perf_counter()
+            - started
+        )
+        started = time.perf_counter()
+        # Only errors need strings or Python serialization. The same two-word
+        # reduction is entered by every worker, including workers with no rows.
+        self._status[0] = int(error is not None)
+        self._status[1] = int(fatal)
+        dist.all_reduce(self._status, op=dist.ReduceOp.MAX, group=self.control_group)
+        self.metrics["status_consensus_seconds"] = (
+            self.metrics.get("status_consensus_seconds", 0.0)
+            + time.perf_counter()
+            - started
+        )
+        if self._status[0].item():
+            self._failed |= bool(self._status[1].item())
+            statuses = self._all_objects(error)
+            raise PlanRejected(f"{label}: " + "; ".join(s for s in statuses if s))
+        return result
+
+    def snapshot(self):
+        """Metadata only; callers cannot mutate engine ownership or cached KV."""
+        return {
+            rid: {"ranks": s.ranks, "end": s.end, "local_tokens": len(s.kv)}
+            for rid, s in self._states.items()
+        }
+
+    def _metadata_digest(self):
+        metadata = (
+            self.version,
+            [
+                (rid, s.prompt.token_ids, s.ranks, s.end)
+                for rid, s in sorted(self._states.items())
+            ],
+        )
+        return hashlib.sha256(repr(metadata).encode()).hexdigest()
+
+    def _validate(self, plan):
+        if not isinstance(plan, PrefillPlan) or type(plan.version) is not int:
+            raise ValueError("Expected a PrefillPlan with an integer version")
+        if plan.version != self.version:
+            raise ValueError(f"Stale plan {plan.version}; expected {self.version}")
+        admitted = [p.request_id for p in plan.admit]
+        steps = [s.request_id for s in plan.steps]
+        released = list(plan.release)
+        for name, values in (
+            ("admit", admitted),
+            ("steps", steps),
+            ("release", released),
+        ):
+            if any(type(v) is not str or not v for v in values):
+                raise ValueError(f"{name}: request IDs must be nonempty strings")
+            if len(set(values)) != len(values):
+                raise ValueError(f"{name}: duplicate request ID")
+        if set(admitted) & set(self._states):
+            raise ValueError("Cannot admit an existing request ID")
+        if set(released) - set(self._states):
+            raise ValueError("Cannot release an unknown request")
+        if set(released) & set(steps):
+            raise ValueError("Cannot release and execute the same request")
+        if set(admitted) - set(steps):
+            raise ValueError("Every admission needs an initial placement step")
+        prompts = {rid: s.prompt for rid, s in self._states.items()}
+        for p in plan.admit:
+            if not isinstance(p.token_ids, tuple) or not p.token_ids:
+                raise ValueError("Prompt token_ids must be a nonempty tuple")
+            if len(p.token_ids) > self.model.context_length:
+                raise ValueError("Prompt exceeds the model context length")
+            if any(
+                type(t) is not int or not 0 <= t < self.model.vocab_size
+                for t in p.token_ids
+            ):
+                raise ValueError("Prompt token ID outside model vocabulary")
+            prompts[p.request_id] = p
+        layouts = {
+            rid: (s.ranks, s.end)
+            for rid, s in self._states.items()
+            if rid not in released
+        }
+        for step in plan.steps:
+            if step.request_id not in prompts:
+                raise ValueError(f"Unknown request {step.request_id!r}")
+            validate_ranks(step.ranks, self.world_size)
+            start = layouts.get(step.request_id, ((), 0))[1]
+            if type(step.end) is not int or not start <= step.end <= len(
+                prompts[step.request_id].token_ids
+            ):
+                raise ValueError(
+                    "Step end must be between the committed cursor and prompt length"
+                )
+            layouts[step.request_id] = (step.ranks, step.end)
+        for rank in range(self.world_size):
+            count = sum(
+                len(local_positions(end, ranks, rank))
+                for ranks, end in layouts.values()
+            )
+            if count > self.max_local_tokens:
+                raise ValueError(
+                    f"Rank {rank} needs {count} KV tokens; capacity is {self.max_local_tokens}"
+                )
+        return prompts
+
+    @torch.inference_mode()
+    def execute(self, plan: PrefillPlan | None = None) -> dict[str, torch.Tensor]:
+        """Execute worker zero's plan; return last-prefix logits on every worker.
+
+        Omitted requests remain resident and paused. A step with end equal to
+        its cursor performs only migration. Release is explicit. Calls must
+        be serialized and made by every worker, including idle workers.
+        """
+        if self._failed:
+            raise RuntimeError("Transport failed; restart the worker group")
+        if self._busy:
+            raise RuntimeError("Concurrent execute() calls are unsupported")
+        self._busy = True
+        self.metrics = {
+            "attention_backend": self.attention_backend,
+            "kv_collectives": 0,
+            "migration_collectives": 0,
+        }
+        try:
+            command = [plan if self.rank == 0 else None]
+            dist.broadcast_object_list(command, src=0, group=self.control_group)
+            plan = command[0]
+            self._agree(self._metadata_digest(), "Worker committed states diverged")
+            prompts = self._checked("plan validation", lambda: self._validate(plan))
+            staged = {
+                rid: s for rid, s in self._states.items() if rid not in plan.release
+            }
+            forwards = []
+            migrated = self._redistribute_batch(plan.steps, prompts)
+            for step, state in zip(plan.steps, migrated):
+                previous = self._states.get(step.request_id)
+                start = previous.end if previous is not None else 0
+                if step.end > start:
+                    forwards.append((state, start))
+                staged[step.request_id] = state
+            outputs = self._prefill_batch(forwards) if forwards else {}
+            # All device work has been checked before publishing any new state.
+            self._agree(self.version, "Worker versions diverged before commit")
+            self._states = staged
+            self.version += 1
+            return outputs
+        except PlanRejected:
+            raise
+        except BaseException:
+            self._failed = True
+            raise
+        finally:
+            self._busy = False
+
+    def _redistribute_batch(self, steps, prompts):
+        if not steps:
+            return []
+        m = self.model
+
+        def allocate():
+            states, changes = [], []
+            tail = (m.num_layers, 2, m.num_kv_heads, m.head_dim)
+            for step in steps:
+                shape = (len(local_positions(step.end, step.ranks, self.rank)), *tail)
+                kv = torch.empty(shape, device=m.device, dtype=m.dtype)
+                state = _State(prompts[step.request_id], step.ranks, step.end, kv)
+                states.append(state)
+                previous = self._states.get(step.request_id)
+                if previous is None or previous.end == 0:
+                    continue
+                if previous.ranks == step.ranks:
+                    kv[: len(previous.kv)].copy_(previous.kv)
+                else:
+                    changes.append((state, previous))
+            if not changes:
+                return states, None
+
+            # One destination-major transfer for all changing prompts. Within
+            # each peer segment, requests occur in canonical plan order.
+            sends, receives = [], []
+            for peer in range(self.world_size):
+                send_parts, recv_parts = [], []
+                for state, previous in changes:
+                    old = local_positions(previous.end, previous.ranks, self.rank)
+                    send_parts.append(
+                        [
+                            i
+                            for i, position in enumerate(old)
+                            if state.ranks[position % len(state.ranks)] == peer
+                        ]
+                    )
+                    recv_parts.append(
+                        [
+                            position
+                            for position in local_positions(
+                                previous.end, previous.ranks, peer
+                            )
+                            if state.ranks[position % len(state.ranks)] == self.rank
+                        ]
+                    )
+                sends.append(send_parts)
+                receives.append(recv_parts)
+            send_counts = [sum(map(len, parts)) for parts in sends]
+            recv_counts = [sum(map(len, parts)) for parts in receives]
+            send = torch.empty(
+                (sum(send_counts), *tail), device=m.device, dtype=m.dtype
+            )
+            recv = torch.empty(
+                (sum(recv_counts), *tail), device=m.device, dtype=m.dtype
+            )
+            offset = 0
+            for parts in sends:
+                for (_, previous), indices in zip(changes, parts):
+                    if indices:
+                        index = torch.tensor(indices, device=m.device, dtype=torch.long)
+                        send[offset : offset + len(indices)].copy_(
+                            previous.kv.index_select(0, index)
+                        )
+                    offset += len(indices)
+            offset, unpack = 0, []
+            for parts in receives:
+                for (state, _), positions in zip(changes, parts):
+                    if positions:
+                        local_offset = state.ranks.index(self.rank)
+                        indices = torch.tensor(
+                            [
+                                (position - local_offset) // len(state.ranks)
+                                for position in positions
+                            ],
+                            device=m.device,
+                            dtype=torch.long,
+                        )
+                        unpack.append((state.kv, indices, offset, len(positions)))
+                    offset += len(positions)
+            self.metrics["migration_workspace_bytes"] = (
+                send.numel() + recv.numel()
+            ) * send.element_size()
+            return states, (send, recv, send_counts, recv_counts, unpack)
+
+        states, transfer = self._checked("KV and migration allocation", allocate)
+        if transfer is not None:
+            send, recv, send_counts, recv_counts, unpack = transfer
+            dist.all_to_all_single(recv, send, recv_counts, send_counts)
+            self.metrics["migration_collectives"] = 1
+
+            def complete():
+                for kv, indices, offset, count in unpack:
+                    kv.index_copy_(0, indices, recv[offset : offset + count])
+
+            self._checked("migration completion", complete)
+        return states
+
+    def _prefill_batch(self, forwards):
+        m = self.model
+        layouts = []
+        all_positions, all_ids = [], []
+        for state, start in forwards:
+            owned = list(local_positions(state.end, state.ranks, self.rank))
+            prefix_count = len(local_positions(start, state.ranks, self.rank))
+            new_positions = owned[prefix_count:]
+            begin = len(all_positions)
+            all_positions.extend(new_positions)
+            all_ids.extend(state.prompt.token_ids[p] for p in new_positions)
+            layouts.append((state, prefix_count, begin, len(all_positions)))
+
+        def embed():
+            positions = torch.tensor(all_positions, device=m.device, dtype=torch.long)
+            ids = torch.tensor(all_ids, device=m.device, dtype=torch.long)
+            x = m.embed(ids) if len(ids) else None
+            return positions, x
+
+        positions, x = self._checked("embedding", embed)
+        workspace = (
+            self._checked("gather workspace", lambda: self._gather_workspace(layouts))
+            if self.attention_backend == "gathered"
+            else None
+        )
+        for layer in range(m.num_layers):
+
+            def prepare(layer=layer, x=x):
+                if x is None:
+                    q = torch.empty(
+                        (0, m.num_heads, m.head_dim), device=m.device, dtype=m.dtype
+                    )
+                else:
+                    q, k, v = m.prepare(layer, x, positions)
+                    expected_q = (len(positions), m.num_heads, m.head_dim)
+                    expected_kv = (len(positions), m.num_kv_heads, m.head_dim)
+                    if (
+                        q.shape != expected_q
+                        or k.shape != expected_kv
+                        or v.shape != expected_kv
+                    ):
+                        raise ValueError(
+                            "Model projection shapes do not match the declared head layout"
+                        )
+                    if any(
+                        t.dtype != m.dtype or t.device != m.device for t in (q, k, v)
+                    ):
+                        raise ValueError("Model projections changed dtype or device")
+                    for state, prefix_count, begin, end in layouts:
+                        state.kv[prefix_count:, layer, 0].copy_(k[begin:end])
+                        state.kv[prefix_count:, layer, 1].copy_(v[begin:end])
+                if workspace is not None:
+                    send, _, _, _ = workspace
+                    offset = 0
+                    for state, _, _, _ in layouts:
+                        count = len(state.kv)
+                        send[offset : offset + count].copy_(state.kv[:, layer])
+                        offset += count
+                    return q
+                return [
+                    [
+                        AttentionAccumulator(
+                            q[i : min(i + self.query_block_size, end)],
+                            positions[i : min(i + self.query_block_size, end)],
+                            m.head_dim**-0.5,
+                        )
+                        for i in range(begin, end, self.query_block_size)
+                    ]
+                    for _, _, begin, end in layouts
+                ]
+
+            accumulators = self._checked(f"layer {layer} projections", prepare)
+            if workspace is not None:
+                send, received, _, _ = workspace
+                # NCCL establishes the current-stream dependency before SDPA.
+                # There are no allocations or model callbacks between the
+                # successful projection vote and this collective.
+                dist.all_gather_single(received, send)
+                self.metrics["kv_collectives"] += 1
+                x = self._checked(
+                    f"layer {layer} attention and output",
+                    lambda layer=layer, x=x, accumulators=accumulators: (
+                        self._gathered_complete(
+                            layer, x, accumulators, positions, layouts, workspace
+                        )
+                    ),
+                )
+                continue
+            # Buffers are bounded by kv_block_size, independent of prompt length.
+            for (state, _, _, _), request_accumulators in zip(layouts, accumulators):
+                for owner in state.ranks:
+                    owner_positions = list(
+                        local_positions(state.end, state.ranks, owner)
+                    )
+                    for offset in range(0, len(owner_positions), self.kv_block_size):
+                        block_positions = owner_positions[
+                            offset : offset + self.kv_block_size
+                        ]
+
+                        def make_block(
+                            owner=owner,
+                            state=state,
+                            offset=offset,
+                            block_positions=block_positions,
+                            layer=layer,
+                        ):
+                            if self.rank == owner:
+                                block = state.kv[
+                                    offset : offset + len(block_positions), layer
+                                ].contiguous()
+                            else:
+                                block = torch.empty(
+                                    (
+                                        len(block_positions),
+                                        2,
+                                        m.num_kv_heads,
+                                        m.head_dim,
+                                    ),
+                                    device=m.device,
+                                    dtype=m.dtype,
+                                )
+                            pos = torch.tensor(
+                                block_positions, device=m.device, dtype=torch.long
+                            )
+                            return block, pos
+
+                        block, key_positions = self._checked(
+                            "attention workspace", make_block
+                        )
+                        dist.broadcast(block, src=owner)
+                        self.metrics["kv_collectives"] += 1
+
+                        def accumulate(
+                            request_accumulators=request_accumulators,
+                            block=block,
+                            key_positions=key_positions,
+                        ):
+                            for acc in request_accumulators:
+                                acc.add(block[:, 0], block[:, 1], key_positions)
+
+                        self._checked(f"layer {layer} attention", accumulate)
+
+            def complete(x=x, accumulators=accumulators, layer=layer):
+                if x is None:
+                    return None
+                output = torch.cat(
+                    [a.finish() for group in accumulators for a in group], dim=0
+                )
+                return m.complete(layer, x, output)
+
+            x = self._checked(f"layer {layer} output", complete)
+
+        def make_logits():
+            outputs = {}
+            finite_checks = []
+            for state, _, _, end in layouts:
+                owner = state.ranks[(state.end - 1) % len(state.ranks)]
+                if self.rank == owner:
+                    result = (
+                        m.logits(x[end - 1 : end]).reshape(m.vocab_size).contiguous()
+                    )
+                    if result.dtype != m.dtype or result.device != m.device:
+                        raise ValueError("Model logits changed dtype or device")
+                    finite_checks.append(torch.isfinite(result).all())
+                else:
+                    result = torch.empty(m.vocab_size, device=m.device, dtype=m.dtype)
+                outputs[state.prompt.request_id] = result
+            if finite_checks and not bool(torch.stack(finite_checks).all()):
+                raise ValueError("Model returned non-finite logits")
+            return outputs
+
+        outputs = self._checked("logits", make_logits)
+        for state, _, _, _ in layouts:
+            owner = state.ranks[(state.end - 1) % len(state.ranks)]
+            dist.broadcast(outputs[state.prompt.request_id], src=owner)
+        self._checked("logits completion", lambda: None)
+        return outputs
+
+    def _gather_workspace(self, layouts):
+        """Reusable one-layer workspace; persistent KV ownership is unchanged."""
+        m = self.model
+        counts = [
+            [len(local_positions(s.end, s.ranks, rank)) for s, _, _, _ in layouts]
+            for rank in range(self.world_size)
+        ]
+        stride = max(map(sum, counts))
+        shape = (stride, 2, m.num_kv_heads, m.head_dim)
+        # Zero padding avoids exposing uninitialized memory to other workers.
+        send = torch.zeros(shape, device=m.device, dtype=m.dtype)
+        received = torch.empty(
+            (self.world_size * stride, *shape[1:]), device=m.device, dtype=m.dtype
+        )
+        offsets = [0] * self.world_size
+        indices, key_positions = [], []
+        for request, (state, _, begin, end) in enumerate(layouts):
+            # Positions p belong to ranks[p % degree], at local offset p // degree.
+            # Only workers computing queries need a full request index map.
+            mapping = (
+                [
+                    state.ranks[p % len(state.ranks)] * stride
+                    + offsets[state.ranks[p % len(state.ranks)]]
+                    + p // len(state.ranks)
+                    for p in range(state.end)
+                ]
+                if begin != end
+                else []
+            )
+            indices.append(torch.tensor(mapping, device=m.device, dtype=torch.long))
+            key_positions.append(
+                torch.arange(state.end if begin != end else 0, device=m.device)
+            )
+            for rank in range(self.world_size):
+                offsets[rank] += counts[rank][request]
+        self.metrics["gather_workspace_bytes"] = (
+            send.numel() + received.numel()
+        ) * send.element_size()
+        return send, received, indices, key_positions
+
+    def _gathered_complete(self, layer, x, q, positions, layouts, workspace):
+        if x is None:
+            return None
+        m = self.model
+        _, received, indices, key_positions = workspace
+        output = torch.empty_like(q)
+        for request, (_, _, begin, end) in enumerate(layouts):
+            if begin == end:
+                continue
+            kv = received.index_select(0, indices[request])
+            k = kv[:, 0].transpose(0, 1).unsqueeze(0)
+            v = kv[:, 1].transpose(0, 1).unsqueeze(0)
+            for offset in range(begin, end, self.query_block_size):
+                stop = min(offset + self.query_block_size, end)
+                visible = (
+                    key_positions[request][None, :] <= positions[offset:stop, None]
+                )
+                # Local query positions can be strided and start after a cached
+                # prefix. is_causal=True would apply the wrong triangular mask.
+                attended = F.scaled_dot_product_attention(
+                    q[offset:stop].transpose(0, 1).unsqueeze(0),
+                    k,
+                    v,
+                    attn_mask=visible,
+                    dropout_p=0.0,
+                    enable_gqa=m.num_heads != m.num_kv_heads,
+                )
+                output[offset:stop].copy_(attended.squeeze(0).transpose(0, 1))
+        return m.complete(layer, x, output)
