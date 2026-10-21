@@ -2820,7 +2820,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Non-streaming outputs are batched; use the scheduler's first-token time.
         if getattr(state.obj, "stream", False) or recv_obj.time_stats is None:
             return None
-        ts = recv_obj.time_stats[i].prefill_finished_time
+        from sglang.srt.utils.monotonic_clock import monotonic_clock_domain
+
+        stats = recv_obj.time_stats[i]
+        raw = getattr(stats, "first_token_monotonic", None)
+        domain = monotonic_clock_domain()
+        # Benchmark timestamps must not use an estimated realtime conversion.
+        if raw is None or domain is None or tuple(raw[0] or ()) != domain:
+            return None
+        ts = raw[1]
         if state.time_stats.created_time < ts <= time.perf_counter():
             return ts
         return None

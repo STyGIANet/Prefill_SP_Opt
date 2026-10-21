@@ -42,6 +42,7 @@ from sglang.srt.observability.trace_async import (
     is_async_tracing_available,
 )
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.monotonic_clock import monotonic_clock_domain
 from sglang.srt.utils.poll_timer import PollTimer
 
 if TYPE_CHECKING:
@@ -628,6 +629,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     wait_queue_entry_time: float = 0.0
     forward_entry_time: float = 0.0
     prefill_finished_time: float = 0.0
+    # Raw timestamp and clock identity survive IPC without realtime rebasing.
+    first_token_monotonic: Optional[tuple] = None
     completion_time: float = 0.0
 
     # prefill node, get by time.perf_counter()
@@ -675,12 +678,17 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     has_timing_data: bool = False
 
     def __getstate__(self) -> object:
+        # Preserve the originating clock across detokenizer/tokenizer hops.
+        raw = self.first_token_monotonic
+        if raw is None:
+            raw = (monotonic_clock_domain(), self.prefill_finished_time)
         # send to detokenizer/tokenizer
         if not (self.enable_metrics or self.has_timing_data):
             # Preserve the first-token boundary without enabling full metrics.
             # The receiver rebases it to its monotonic clock as for other times.
             return {
                 "prefill_finished_time": self.prefill_finished_time,
+                "first_token_monotonic": raw,
                 "diff_realtime_monotonic": global_diff_realtime_monotonic,
             }
 
@@ -689,6 +697,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
+            "first_token_monotonic": raw,
             # Read by meta_info["queue_time"] on the tokenizer; timestamps cannot rebuild it.
             "queue_duration_s": self.queue_duration_s,
             "storage_prefetch_wait_s": (

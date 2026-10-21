@@ -8,7 +8,7 @@ import math
 def throughput_summary(records):
     """Use completed requests, each counted once, on one monotonic clock.
 
-    Timestamps are offsets from each run's origin, not clocks from GPU workers.
+    Timestamps are offsets from each run's origin on a shared monotonic clock.
     Includes queueing and idle gaps. Does not estimate saturated device capacity.
     """
     if not records:
@@ -20,6 +20,9 @@ def throughput_summary(records):
             "prefill_wall_seconds": 0.0,
             "useful_tokens_per_second": 0.0,
         }
+    ids = [r["request_id"] for r in records if "request_id" in r]
+    if len(set(ids)) != len(ids):
+        raise ValueError("Each completed request must be counted exactly once")
     for r in records:
         start, end = r["submission_time_seconds"], r["completion_time_seconds"]
         if not all(math.isfinite(v) for v in (start, end)) or end <= start:

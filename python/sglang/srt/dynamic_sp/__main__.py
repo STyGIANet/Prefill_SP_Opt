@@ -7,6 +7,7 @@ import importlib
 import json
 import math
 import os
+import socket
 import statistics
 import time
 from dataclasses import asdict
@@ -110,6 +111,8 @@ def read_schedule(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
+    parser.add_argument("--execution-mode", choices=("async", "sync"), default="async")
+    parser.add_argument("--async-timeout", type=float, default=600)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument(
         "--dtype", choices=("float32", "float16", "bfloat16"), default="float32"
@@ -125,7 +128,11 @@ def main():
     parser.add_argument(
         "--scheduler",
         default="greedy",
-        help="greedy or module:factory taking SchedulerConfig",
+        help="greedy, tetris, or module:factory taking SchedulerConfig",
+    )
+    parser.add_argument(
+        "--tetris-profile",
+        help="Fitted latency models and simulated load thresholds JSON",
     )
     parser.add_argument("--max-running-requests", type=int, default=32)
     parser.add_argument("--max-batch-tokens", type=int, default=32768)
@@ -133,12 +140,15 @@ def main():
     parser.add_argument("--prompt-length", type=int, default=512)
     parser.add_argument("--chunk-size", type=int, default=32)
     parser.add_argument(
-        "--attention-backend", choices=("gathered", "streaming"), default="gathered"
+        "--attention-backend", choices=("ring", "gathered", "streaming"), default="ring"
     )
     parser.add_argument(
         "--kv-transport", choices=("targeted", "all_gather"), default="targeted"
     )
     parser.add_argument("--shared-attention", choices=("auto", "sdpa"), default="auto")
+    parser.add_argument(
+        "--migration-overlap", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--kv-block-size", type=int, default=256)
     parser.add_argument("--query-block-size", type=int, default=128)
     parser.add_argument("--verify", action=argparse.BooleanOptionalAction, default=True)
@@ -152,6 +162,10 @@ def main():
         parser.error("prompt-length and chunk-size must be positive")
     if any(not math.isfinite(t) or t < 0 for t in (args.atol, args.rtol)):
         parser.error("tolerances must be finite and nonnegative")
+    if args.scheduler == "tetris" and not args.tetris_profile and not args.schedule:
+        parser.error("--scheduler tetris requires --tetris-profile")
+    if not math.isfinite(args.async_timeout) or args.async_timeout <= 0:
+        parser.error("async-timeout must be finite and positive")
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if args.device == "cuda":
         torch.cuda.set_device(local_rank)
@@ -176,7 +190,20 @@ def main():
             logits_mode="all" if args.verify else "completed",
             kv_transport=args.kv_transport,
             shared_attention=args.shared_attention,
+            migration_overlap=args.migration_overlap,
         )
+
+        profile_gpu_names = (
+            engine._all_objects(torch.cuda.get_device_name(local_rank))
+            if args.scheduler == "tetris" and args.device == "cuda"
+            else None
+        )
+
+        profile_nodes = None
+        if args.scheduler == "tetris":
+            hosts = engine._all_objects(socket.gethostname())
+            unique_hosts = list(dict.fromkeys(hosts))
+            profile_nodes = [unique_hosts.index(host) for host in hosts]
 
         def load_input():
             if dist.get_rank() != 0:
@@ -192,6 +219,30 @@ def main():
             )
             if args.scheduler == "greedy":
                 policy = GreedyScheduler(config)
+            elif args.scheduler == "tetris":
+                from sglang.srt.dynamic_sp.tetris import TetrisScheduler
+
+                policy = TetrisScheduler.from_file(config, args.tetris_profile)
+                if policy.profile["nodes"] != profile_nodes:
+                    raise ValueError(
+                        "Tetris profile topology does not match the current rank-to-node mapping"
+                    )
+                metadata = policy.profile.get("metadata", {})
+                for key, value in (
+                    ("model_path", os.path.realpath(args.model_path)),
+                    ("execution_mode", args.execution_mode),
+                    ("gpu_names", profile_gpu_names),
+                    ("world_size", dist.get_world_size()),
+                    ("dtype", args.dtype),
+                    ("attention_backend", args.attention_backend),
+                    ("kv_transport", args.kv_transport),
+                    ("shared_attention", args.shared_attention),
+                    ("migration_overlap", args.migration_overlap),
+                ):
+                    if metadata.get(key) != value:
+                        raise ValueError(
+                            f"Tetris profile {key}={metadata.get(key)!r} does not match {value!r}"
+                        )
             else:
                 module, name = args.scheduler.rsplit(":", 1)
                 policy = getattr(importlib.import_module(module), name)(config)
@@ -233,6 +284,11 @@ def main():
 
         loaded = engine._checked("scheduler initialization", load_input)
         plans, scheduler, arrivals = loaded if loaded is not None else (None, None, [])
+        if args.execution_mode == "async":
+            from sglang.srt.dynamic_sp.async_runner import run_async
+
+            run_async(args, model, control, scheduler, arrivals, plans)
+            return
         index = 0
         arrival_records = []
         executed_plans = []
@@ -398,6 +454,9 @@ def main():
                     "version": engine.version,
                     "seconds": elapsed,
                     "scheduling_seconds": scheduling_seconds,
+                    "tetris_decision": scheduler.policy.last_decision
+                    if scheduler is not None and args.scheduler == "tetris"
+                    else None,
                     "new_tokens": new_tokens,
                     "tokens_per_second": new_tokens / elapsed if new_tokens else None,
                     "prompt_ttft_seconds": completed,
@@ -477,6 +536,7 @@ def main():
                     Path(args.output).write_text(
                         json.dumps(
                             {
+                                "execution_mode": "sync",
                                 "world_size": dist.get_world_size(),
                                 "model": args.model_path,
                                 "dtype": args.dtype,
@@ -484,6 +544,9 @@ def main():
                                 if not args.schedule
                                 else "replay",
                                 "scheduler_settings": {
+                                    "tetris": scheduler.policy.metadata()
+                                    if args.scheduler == "tetris"
+                                    else None,
                                     "chunk_tokens": args.chunk_size,
                                     "max_running_requests": args.max_running_requests,
                                     "max_batch_tokens": args.max_batch_tokens,
@@ -507,7 +570,8 @@ def main():
     finally:
         if arrival_source is not None:
             arrival_source.close()
-        dist.destroy_process_group()
+        if not getattr(args, "async_failed", False):
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

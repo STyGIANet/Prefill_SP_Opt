@@ -30,6 +30,7 @@ class RequestView:
     ranks: tuple[int, ...] = ()
     end: int = 0
     last_scheduled_version: int = -1
+    in_flight: bool = False
 
     @property
     def complete(self):
@@ -45,6 +46,8 @@ class SchedulerInput:
     # observation immutable; policies may convert them to dictionaries locally.
     worker_metrics: tuple[tuple[tuple[str, object], ...], ...] = ()
     last_step_seconds: float | None = None
+    busy_ranks: tuple[int, ...] = ()
+    worker_available_at: tuple[float, ...] = ()
 
 
 class SchedulingPolicy(Protocol):
@@ -68,11 +71,16 @@ class GreedyScheduler:
 
     def next_plan(self, state: SchedulerInput) -> PrefillPlan | None:
         c = self.config
-        release = tuple(r.prompt.request_id for r in state.requests if r.complete)
+        busy = set(state.busy_ranks)
+        release = tuple(
+            r.prompt.request_id
+            for r in state.requests
+            if r.complete and not r.in_flight and not busy.intersection(r.ranks)
+        )
         resident = [r for r in state.requests if r.ranks and not r.complete]
-        pending = [r for r in state.requests if not r.ranks]
+        pending = [r for r in state.requests if not r.ranks and not r.in_flight]
         candidates = sorted(
-            resident,
+            (r for r in resident if not r.in_flight and not busy.intersection(r.ranks)),
             key=lambda r: (
                 r.last_scheduled_version,
                 r.submitted_at,
@@ -83,7 +91,10 @@ class GreedyScheduler:
         runnable = min(len(candidates), c.max_running_requests, c.max_batch_tokens)
         if not runnable:
             return PrefillPlan(state.version, release=release) if release else None
-        desired = (c.world_size + runnable - 1) // runnable
+        free = c.world_size - len(busy)
+        if not free:
+            return PrefillPlan(state.version, release=release) if release else None
+        desired = (free + runnable - 1) // runnable
         reserved = [0] * c.world_size
         load = [0] * c.world_size
 
@@ -93,7 +104,9 @@ class GreedyScheduler:
                 for rank in range(c.world_size)
             ]
 
-        for request in resident:
+        for request in state.requests:
+            if not request.ranks or request.prompt.request_id in release:
+                continue
             for rank, count in enumerate(charges(request, request.ranks)):
                 reserved[rank] += count
         steps, admit = [], []
@@ -129,11 +142,11 @@ class GreedyScheduler:
                 )
 
             order = sorted(
-                range(c.world_size),
+                (r for r in range(c.world_size) if r not in busy),
                 key=lambda r: (load[r], available[r], r not in request.ranks, r),
             )
             ranks = None
-            for degree in range(desired, c.world_size + 1):
+            for degree in range(desired, free + 1):
                 chosen = []
                 for offset in range(degree):
                     required = len(range(offset, length, degree))
@@ -176,6 +189,8 @@ class GreedyScheduler:
             if not request.ranks:
                 admit.append(request.prompt)
                 running += 1
+        if not steps and not release and busy:
+            return None
         if not steps and not release:
             raise RuntimeError(
                 "No request fits the configured KV capacity; scheduler made no progress"

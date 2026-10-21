@@ -3,9 +3,9 @@
 """Collective, transactional execution of per-prompt SP placement plans.
 
 One caller per worker enters execute(); only worker zero supplies a plan.
-All communication uses a fixed world communicator, avoiding collective group
-creation on the scheduling path. Only designated owners compute tokens and
-retain KV. Nonowners participate in control and layer KV communication.
+Communication uses the execution group, which may be the whole world or an
+asynchronously leased subset. Only designated owners compute tokens and retain
+KV. Nonowners participate in control and migration collectives.
 
 Plans commit after every requested prefill and migration has succeeded. Old
 KV remains live until commit, so recoverable validation/allocation/model
@@ -82,6 +82,8 @@ class DynamicSPPrefillEngine:
         model: PrefillModel,
         *,
         control_group,
+        data_group=None,
+        communication=None,
         max_local_tokens: int,
         kv_block_size: int = 256,
         query_block_size: int = 128,
@@ -89,14 +91,29 @@ class DynamicSPPrefillEngine:
         logits_mode: str = "all",
         kv_transport: str = "targeted",
         shared_attention: str = "auto",
+        migration_overlap: bool = True,
     ):
         if not dist.is_initialized():
             raise RuntimeError("Initialize torch.distributed before the SP engine")
-        self.rank = dist.get_rank()
-        self.world_size = dist.get_world_size()
-        if dist.get_world_size(control_group) != self.world_size:
-            raise ValueError("Control group must contain every world rank")
+        self.communication = communication
+        self.data_group = data_group
         self.control_group = control_group
+        if communication is not None:
+            self.rank = communication.rank
+            self.world_size = communication.world_size
+            self.global_ranks = communication.global_ranks
+        else:
+            self.rank = dist.get_rank(data_group)
+            self.world_size = dist.get_world_size(data_group)
+            self.global_ranks = tuple(
+                dist.get_process_group_ranks(data_group or dist.group.WORLD)
+            )
+            if dist.get_world_size(control_group) != self.world_size:
+                raise ValueError(
+                    "Control and data groups must have identical membership"
+                )
+            if tuple(dist.get_process_group_ranks(control_group)) != self.global_ranks:
+                raise ValueError("Control and data group rank orders differ")
         self.model = model
         self.max_local_tokens = max_local_tokens
         self.kv_block_size = kv_block_size
@@ -105,6 +122,10 @@ class DynamicSPPrefillEngine:
         self.logits_mode = logits_mode
         self.kv_transport = kv_transport
         self.shared_attention = shared_attention
+        self.migration_overlap = migration_overlap
+        self._migration = None
+        self._ring = None
+        self._ring_initialized = False
         self.metrics = {}
         self._status = torch.zeros(2, dtype=torch.int32, device="cpu")
         self.version = 0
@@ -128,6 +149,7 @@ class DynamicSPPrefillEngine:
                 logits_mode,
                 kv_transport,
                 shared_attention,
+                migration_overlap,
             ),
             "Worker model/configuration mismatch",
         )
@@ -140,8 +162,8 @@ class DynamicSPPrefillEngine:
         if self.logits_mode not in ("all", "completed"):
             raise ValueError("logits_mode must be all or completed")
         m = self.model
-        if self.attention_backend not in ("gathered", "streaming"):
-            raise ValueError("attention_backend must be gathered or streaming")
+        if self.attention_backend not in ("gathered", "streaming", "ring"):
+            raise ValueError("attention_backend must be gathered, streaming or ring")
         for value in (
             self.max_local_tokens,
             self.kv_block_size,
@@ -161,9 +183,25 @@ class DynamicSPPrefillEngine:
             raise ValueError("Query head count must be divisible by KV head count")
 
     def _all_objects(self, value):
+        if self.communication is not None:
+            return self.communication.objects(value)
         results = [None] * self.world_size
         dist.all_gather_object(results, value, group=self.control_group)
         return results
+
+    def _broadcast(self, tensor, owner):
+        if self.communication is not None:
+            self.communication.broadcast(tensor, owner)
+        else:
+            dist.broadcast(tensor, src=self.global_ranks[owner], group=self.data_group)
+
+    def _exchange(self, output, value, receive_counts, send_counts):
+        if self.communication is not None:
+            self.communication.exchange(output, value, receive_counts, send_counts)
+        else:
+            dist.all_to_all_single(
+                output, value, receive_counts, send_counts, group=self.data_group
+            )
 
     def _agree(self, value, message):
         values = self._all_objects(value)
@@ -176,8 +214,8 @@ class DynamicSPPrefillEngine:
         result, error, fatal = None, None, False
         try:
             result = fn()
-            if self.model.device.type == "cuda":
-                torch.cuda.synchronize(self.model.device)
+            # CUDA work stays asynchronous here. Cross-stream dependencies are
+            # explicit events; device execution errors are checked at commit.
         except Exception as exc:  # noqa: BLE001 - every local failure needs consensus
             error = f"rank {self.rank}: {type(exc).__name__}: {exc}"
             # An asynchronous CUDA execution error can invalidate the context.
@@ -198,7 +236,12 @@ class DynamicSPPrefillEngine:
         # reduction is entered by every worker, including workers with no rows.
         self._status[0] = int(error is not None)
         self._status[1] = int(fatal)
-        dist.all_reduce(self._status, op=dist.ReduceOp.MAX, group=self.control_group)
+        if self.communication is not None:
+            self.communication.status(self._status)
+        else:
+            dist.all_reduce(
+                self._status, op=dist.ReduceOp.MAX, group=self.control_group
+            )
         self.metrics["status_consensus_seconds"] = (
             self.metrics.get("status_consensus_seconds", 0.0)
             + time.perf_counter()
@@ -209,6 +252,10 @@ class DynamicSPPrefillEngine:
             statuses = self._all_objects(error)
             raise PlanRejected(f"{label}: " + "; ".join(s for s in statuses if s))
         return result
+
+    def _complete_device_work(self):
+        if self.model.device.type == "cuda":
+            torch.cuda.current_stream(self.model.device).synchronize()
 
     def snapshot(self):
         """Metadata only; callers cannot mutate engine ownership or cached KV."""
@@ -307,6 +354,7 @@ class DynamicSPPrefillEngine:
         self._busy = True
         self.metrics = {
             "attention_backend": self.attention_backend,
+            "migration_overlap": self.migration_overlap,
             "kv_collectives": 0,
             "migration_collectives": 0,
             "logit_collectives": 0,
@@ -317,7 +365,12 @@ class DynamicSPPrefillEngine:
         }
         try:
             command = [plan if self.rank == 0 else None]
-            dist.broadcast_object_list(command, src=0, group=self.control_group)
+            if self.communication is not None:
+                command[0] = self._all_objects(command[0])[0]
+            else:
+                dist.broadcast_object_list(
+                    command, src=self.global_ranks[0], group=self.control_group
+                )
             plan = command[0]
             self._agree(self._metadata_digest(), "Worker committed states diverged")
             prompts = self._checked("plan validation", lambda: self._validate(plan))
@@ -325,7 +378,25 @@ class DynamicSPPrefillEngine:
                 rid: s for rid, s in self._states.items() if rid not in plan.release
             }
             forwards = []
-            migrated = self._redistribute_batch(plan.steps, prompts)
+            if self.attention_backend == "ring" and not self._ring_initialized:
+                # NCCL batched P2P may use a subset only after group-wide init.
+                token = self._checked(
+                    "ring transport allocation",
+                    lambda: torch.zeros(
+                        1, device=self.model.device, dtype=self.model.dtype
+                    ),
+                )
+                if self.communication is not None:
+                    self.communication.data.allreduce([token]).wait()
+                else:
+                    dist.all_reduce(token, group=self.data_group)
+                self._checked("ring transport initialization", lambda: None)
+                self._ring_initialized = True
+            deferred = (
+                self.attention_backend in ("ring", "gathered")
+                and self.migration_overlap
+            )
+            migrated = self._redistribute_batch(plan.steps, prompts, deferred=deferred)
             for step, state in zip(plan.steps, migrated):
                 previous = self._states.get(step.request_id)
                 start = previous.end if previous is not None else 0
@@ -333,7 +404,16 @@ class DynamicSPPrefillEngine:
                     forwards.append((state, start))
                 staged[step.request_id] = state
             outputs = self._prefill_batch(forwards) if forwards else {}
-            # All device work has been checked before publishing any new state.
+            if not forwards and self._migration is not None:
+                self._migration.wait(0)
+                for layer in range(1, self.model.num_layers):
+                    self._migration.launch(layer)
+                    self._migration.wait(layer)
+                self._checked("migration-only completion", self._migration.drain)
+            # One completion boundary per transaction, after communication
+            # streams have joined the compute stream through their ready events.
+            # Do not synchronize the entire device: independent work may overlap.
+            self._checked("device completion", self._complete_device_work)
             self._agree(self.version, "Worker versions diverged before commit")
             self._states = staged
             self.version += 1
@@ -344,9 +424,21 @@ class DynamicSPPrefillEngine:
             self._failed = True
             raise
         finally:
-            self._busy = False
+            try:
+                # Never free or reuse staging buffers with device work in flight,
+                # including recoverable failures in model callbacks.
+                if self._migration is not None:
+                    self._migration.drain()
+                if self._ring is not None:
+                    self._ring.drain()
+            except BaseException:
+                self._failed = True
+                raise
+            finally:
+                self._migration = self._ring = None
+                self._busy = False
 
-    def _redistribute_batch(self, steps, prompts):
+    def _redistribute_batch(self, steps, prompts, deferred=False):
         if not steps:
             return []
         m = self.model
@@ -396,20 +488,24 @@ class DynamicSPPrefillEngine:
                 receives.append(recv_parts)
             send_counts = [sum(map(len, parts)) for parts in sends]
             recv_counts = [sum(map(len, parts)) for parts in receives]
+            transfer_tail = tail[1:] if deferred else tail
             send = torch.empty(
-                (sum(send_counts), *tail), device=m.device, dtype=m.dtype
+                (sum(send_counts), *transfer_tail), device=m.device, dtype=m.dtype
             )
             recv = torch.empty(
-                (sum(recv_counts), *tail), device=m.device, dtype=m.dtype
+                (sum(recv_counts), *transfer_tail), device=m.device, dtype=m.dtype
             )
-            offset = 0
+            offset, pack = 0, []
             for parts in sends:
                 for (_, previous), indices in zip(changes, parts):
                     if indices:
                         index = torch.tensor(indices, device=m.device, dtype=torch.long)
-                        send[offset : offset + len(indices)].copy_(
-                            previous.kv.index_select(0, index)
-                        )
+                        if deferred:
+                            pack.append((previous.kv, index, offset, len(indices)))
+                        else:
+                            send[offset : offset + len(indices)].copy_(
+                                previous.kv.index_select(0, index)
+                            )
                     offset += len(indices)
             offset, unpack = 0, []
             for parts in receives:
@@ -429,12 +525,20 @@ class DynamicSPPrefillEngine:
             self.metrics["migration_workspace_bytes"] = (
                 send.numel() + recv.numel()
             ) * send.element_size()
-            return states, (send, recv, send_counts, recv_counts, unpack)
+            transfer = (send, recv, send_counts, recv_counts, unpack)
+            if deferred:
+                from sglang.srt.dynamic_sp.ring import LayerMigration
+
+                return states, LayerMigration(self, (*transfer, pack))
+            return states, transfer
 
         states, transfer = self._checked("KV and migration allocation", allocate)
-        if transfer is not None:
+        if transfer is not None and deferred:
+            self._migration = transfer
+            self._migration.launch(0)
+        elif transfer is not None:
             send, recv, send_counts, recv_counts, unpack = transfer
-            dist.all_to_all_single(recv, send, recv_counts, send_counts)
+            self._exchange(recv, send, recv_counts, send_counts)
             self.metrics["migration_collectives"] = 1
 
             def complete():
@@ -469,9 +573,13 @@ class DynamicSPPrefillEngine:
             if self.attention_backend == "gathered"
             else None
         )
-        if workspace is not None:
+        if self.attention_backend == "ring":
+            x = self._prefill_ring(x, positions, layouts)
+        elif workspace is not None:
             x = self._prefill_gathered(x, positions, layouts, workspace)
-        for layer in range(0 if workspace is not None else m.num_layers):
+        for layer in range(
+            m.num_layers if self.attention_backend == "streaming" else 0
+        ):
 
             def prepare(layer=layer, x=x):
                 q = self._project_layer(layer, x, positions, layouts)
@@ -529,7 +637,7 @@ class DynamicSPPrefillEngine:
                         block, key_positions = self._checked(
                             "attention workspace", make_block
                         )
-                        dist.broadcast(block, src=owner)
+                        self._broadcast(block, owner)
                         self.metrics["kv_collectives"] += 1
 
                         def accumulate(
@@ -584,10 +692,45 @@ class DynamicSPPrefillEngine:
         outputs = self._checked("logits", make_logits)
         for state, _, _, _ in logit_layouts:
             owner = state.ranks[(state.end - 1) % len(state.ranks)]
-            dist.broadcast(outputs[state.prompt.request_id], src=owner)
+            self._broadcast(outputs[state.prompt.request_id], owner)
             self.metrics["logit_collectives"] += 1
         self._checked("logits completion", lambda: None)
         return outputs
+
+    def _prefill_ring(self, x, positions, layouts):
+        from sglang.srt.dynamic_sp.ring import RingWorkspace
+
+        self._ring = self._checked(
+            "ring workspace", lambda: RingWorkspace(self, layouts)
+        )
+        for layer in range(self.model.num_layers):
+            if self._migration is not None:
+                self._migration.wait(layer)
+            q = self._checked(
+                "ring projections",
+                lambda layer=layer, x=x: self._project_layer(
+                    layer, x, positions, layouts
+                ),
+            )
+            accumulators = self._checked(
+                "ring preparation",
+                lambda layer=layer, q=q: self._ring.prepare(
+                    layer, q, positions, layouts
+                ),
+            )
+            attention = self._ring.attention(q, layouts, accumulators)
+            # Previous-layer attention no longer uses the communicator. Start
+            # balancing the next layer, then enqueue this layer's output/MLP.
+            # The next iteration waits for migrated history before reading it.
+            if self._migration is not None and layer + 1 < self.model.num_layers:
+                self._migration.launch(layer + 1)
+            x = self._checked(
+                "ring output",
+                lambda layer=layer, x=x, attention=attention: (
+                    self.model.complete(layer, x, attention) if x is not None else None
+                ),
+            )
+        return x
 
     def _project_layer(self, layer, x, positions, layouts, workspace=None):
         m = self.model
@@ -618,6 +761,8 @@ class DynamicSPPrefillEngine:
         return q
 
     def _prefill_gathered(self, x, positions, layouts, workspace):
+        if self._migration is not None:
+            return self._prefill_gathered_migrating(x, positions, layouts, workspace)
         if not workspace.shared:
             # No transport occurs inside this region. A local failure can skip
             # subsequent layers safely; all ranks vote before logits or commit.
@@ -642,14 +787,19 @@ class DynamicSPPrefillEngine:
             # Every allocation, pack and model callback precedes a successful
             # collective vote. Idle ranks enter this transport with zero splits.
             if self.kv_transport == "targeted":
-                dist.all_to_all_single(
+                self._exchange(
                     workspace.received,
                     workspace.send,
-                    output_split_sizes=workspace.receive_counts,
-                    input_split_sizes=workspace.send_counts,
+                    workspace.receive_counts,
+                    workspace.send_counts,
                 )
             else:
-                dist.all_gather_single(workspace.received, workspace.send)
+                if self.communication is not None:
+                    self.communication.gather(workspace.received, workspace.send)
+                else:
+                    dist.all_gather_single(
+                        workspace.received, workspace.send, group=self.data_group
+                    )
             self.metrics["kv_collectives"] += 1
 
             def complete_and_prepare(layer=layer, x=x, q=q):
@@ -670,6 +820,47 @@ class DynamicSPPrefillEngine:
             # peers in the following collective or modify committed KV.
             x, q = self._checked(
                 f"layer {layer} output and next projections", complete_and_prepare
+            )
+        return x
+
+    def _prefill_gathered_migrating(self, x, positions, layouts, workspace):
+        """Use the same layer migration pipeline with targeted exchange/all-gather."""
+        for layer in range(self.model.num_layers):
+            self._migration.wait(layer)
+            q = self._checked(
+                "gathered projections",
+                lambda layer=layer, x=x: self._project_layer(
+                    layer, x, positions, layouts, workspace
+                ),
+            )
+            if workspace.shared:
+                if self.kv_transport == "targeted":
+                    self._exchange(
+                        workspace.received,
+                        workspace.send,
+                        workspace.receive_counts,
+                        workspace.send_counts,
+                    )
+                elif self.communication is not None:
+                    self.communication.gather(workspace.received, workspace.send)
+                else:
+                    dist.all_gather_single(
+                        workspace.received, workspace.send, group=self.data_group
+                    )
+                self.metrics["kv_collectives"] += 1
+            attention = self._checked(
+                "gathered attention",
+                lambda layer=layer, q=q: self._gathered_attention(
+                    layer, q, positions, layouts, workspace
+                ),
+            )
+            if layer + 1 < self.model.num_layers:
+                self._migration.launch(layer + 1)
+            x = self._checked(
+                "gathered output",
+                lambda layer=layer, x=x, attention=attention: (
+                    self.model.complete(layer, x, attention) if x is not None else None
+                ),
             )
         return x
 
@@ -781,6 +972,11 @@ class DynamicSPPrefillEngine:
     def _gathered_complete(self, layer, x, q, positions, layouts, workspace):
         if x is None:
             return None
+        return self.model.complete(
+            layer, x, self._gathered_attention(layer, q, positions, layouts, workspace)
+        )
+
+    def _gathered_attention(self, layer, q, positions, layouts, workspace):
         m = self.model
         received, indices, key_positions = (
             workspace.received,
@@ -853,4 +1049,4 @@ class DynamicSPPrefillEngine:
                     enable_gqa=m.num_heads != m.num_kv_heads,
                 )
                 output[offset:stop].copy_(attended.squeeze(0).transpose(0, 1))
-        return m.complete(layer, x, output)
+        return output

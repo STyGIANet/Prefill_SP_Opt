@@ -76,8 +76,18 @@ def main():
     parser.add_argument("--dataset-revision", default="main")
     parser.add_argument("--split", default="train")
     parser.add_argument("--text-column", default="text")
-    parser.add_argument("--num-prompts", type=int, default=32)
+    parser.add_argument(
+        "--num-prompts",
+        default="all",
+        help="all (default) or a positive count of eligible records",
+    )
     parser.add_argument("--input-tokens", type=int, default=8192)
+    parser.add_argument(
+        "--length-mode",
+        choices=("fixed", "natural"),
+        default="fixed",
+        help="fixed skips short records; natural preserves lengths up to input-tokens",
+    )
     parser.add_argument("--chunk-tokens", type=int, default=1024)
     parser.add_argument(
         "--export-trace",
@@ -97,8 +107,17 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
-    if min(args.num_prompts, args.input_tokens, args.chunk_tokens) <= 0:
-        parser.error("Prompt count and token counts must be positive")
+    if args.num_prompts == "all":
+        args.num_prompts = None
+    else:
+        try:
+            args.num_prompts = int(args.num_prompts)
+        except ValueError:
+            parser.error("num-prompts must be all or a positive integer")
+        if args.num_prompts <= 0:
+            parser.error("num-prompts must be all or a positive integer")
+    if min(args.input_tokens, args.chunk_tokens) <= 0:
+        parser.error("Token counts must be positive")
 
     try:
         request_rate_for_token_load([args.input_tokens], args.offered_load)
@@ -171,7 +190,7 @@ def main():
         tokens = tokenizer.encode(
             text, add_special_tokens=False, truncation=True, max_length=needed
         )
-        if len(tokens) < needed:
+        if not tokens or (args.length_mode == "fixed" and len(tokens) < needed):
             continue
         prompts.append(bos + tokens)
         source_rows.append(
@@ -183,8 +202,10 @@ def main():
         )
         if len(prompts) == args.num_prompts:
             break
-    if len(prompts) != args.num_prompts:
-        raise ValueError(f"Dataset yielded only {len(prompts)} full prompts")
+    if not prompts:
+        raise ValueError("Dataset yielded no eligible prompts")
+    if args.num_prompts is not None and len(prompts) != args.num_prompts:
+        raise ValueError(f"Dataset yielded only {len(prompts)} eligible prompts")
     mean_prompt_tokens = sum(map(len, prompts)) / len(prompts)
     request_rate = request_rate_for_token_load(map(len, prompts), args.offered_load)
     arrival_times = (
@@ -218,6 +239,7 @@ def main():
         "source_rows": source_rows,
         "num_prompts": len(prompts),
         "input_tokens": args.input_tokens,
+        "length_mode": args.length_mode,
         "chunk_tokens": args.chunk_tokens,
         "seed": args.seed,
         "world_size": 8,
@@ -231,7 +253,14 @@ def main():
         else None,
         "arrival_seed": args.arrival_seed,
         "last_arrival_seconds": arrival_times[-1],
-        "construction": "One prefix per distinct dataset row; BOS per prompt; rows shorter than the requested length are skipped",
+        "construction": (
+            "One prefix per distinct dataset row; BOS per prompt; "
+            + (
+                "rows shorter than the requested length are skipped"
+                if args.length_mode == "fixed"
+                else "natural lengths retained up to input_tokens; empty token sequences skipped"
+            )
+        ),
         "workload_sha256": hashlib.sha256(encoded.encode()).hexdigest(),
         "scheduling": "online",
     }
@@ -244,7 +273,8 @@ def main():
     )
     print(f"[dynamic-sp] {load_description}", flush=True)
     print(
-        f"[dynamic-sp] prepared {len(prompts)} prompts x {args.input_tokens} tokens "
+        f"[dynamic-sp] prepared {len(prompts)} prompts; mean_tokens={mean_prompt_tokens:g} "
+        f"length_mode={args.length_mode} token_limit={args.input_tokens} "
         f"from {args.dataset}/{args.split}; chunk={args.chunk_tokens}; manifest={output / 'manifest.json'}",
         flush=True,
     )
