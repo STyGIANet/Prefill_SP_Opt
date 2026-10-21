@@ -48,10 +48,45 @@ Placement changes pack the affected prompts into one destination-major
 all-to-all transfer per plan. Migration preserves token positions and stored
 values without arithmetic or prefix recomputation.
 
-The default `gathered` backend performs one packed KV all-gather per layer for
-active prompts. Each worker evaluates causal PyTorch SDPA for its local queries
-using absolute positions. Attention is isolated between prompts. Persistent KV
-remains sharded, but active KV for one layer is temporarily replicated.
+The default `gathered` backend reconstructs shared KV only on workers that
+compute new queries for that prompt. `--kv-transport targeted` packs an
+all-to-all transfer with variable per-peer sizes. A prompt's degree-one KV stays
+local; shared KV is sent only to consumers of the current chunk, including when
+some members have no new queries. Idle workers participate with zero transfer
+sizes. The fixed world communicator permits arbitrary ordered memberships
+without creating process groups during scheduling. `--kv-transport all_gather`
+retains the previous padded world all-gather for controlled comparisons.
+Pass runner options through the root launcher after `--`, for example
+`./launch_dynamic_sp_8gpu.sh <launch options> -- --kv-transport all_gather
+--shared-attention sdpa`. These switches retain the combined error checks.
+
+For shared prompts, `--shared-attention auto` uses tiled Triton attention on
+CUDA with FP16 or BF16 and head dimensions up to 256. Query positions follow the
+existing cyclic ownership rule; the fused kernel applies absolute-position
+causality and accumulates online softmax in FP32 without a dense mask. FP32,
+FP64, CPU, and larger head dimensions use PyTorch SDPA. `--shared-attention sdpa`
+selects that reference implementation explicitly. Degree-one prompts retain
+SDPA with a lower-right causal bias. Triton specializes on head layout, dtype,
+and SP degree, but query length, KV length, and prefix position remain runtime
+arguments. First use of a new kernel specialization still incurs compilation.
+
+Shared batches check initial projections, then combine each layer's attention
+and output with the next layer's projections in one local phase. Every phase
+is checked collectively before the next KV transfer. An all-private batch has
+no layer transport and checks all local layers together. Recoverable errors
+reject the entire staged plan; these changes do not weaken commit or rollback
+semantics. For $L$ layers, layer-computation checks decrease from $2L$ to $L+1$
+for shared batches, and from $L$ to one for private batches. Setup, migration,
+and logit checks are additional.
+
+With `--no-verify`, vocabulary projection and logit broadcast occur only when a
+prompt finishes prefill. Verification retains prefix logits at every advancing
+step. The engine API defaults to `logits_mode="all"`; callers that need only
+completed prompts can select `logits_mode="completed"`. Both modes compute the
+same KV states. Per-step metrics record shared and private KV rows, workspace
+bytes, per-layer send and receive bytes, fused attention calls, and collective
+counts. Transport byte counters include self transfers; they are not network
+traffic measurements.
 
 The alternative `streaming` backend processes bounded KV blocks and accumulates
 online softmax in FP32. It reduces temporary KV storage at the cost of additional
@@ -200,6 +235,11 @@ and an offered load of 8192 tokens/s. SP reference verification is enabled by
 default with absolute and relative tolerances of `1e-4`. These tolerances are
 not automatically relaxed for BF16; use FP32 for the initial correctness check
 and assess reduced precision separately.
+
+Run directories use UTC timestamps, for example
+`work/dynamic-sp-8gpu-2026-10-20_19-30-00Z` or
+`work/sglang-dp-8gpu-2026-10-20_19-30-00Z`. Simultaneous launches receive
+numeric suffixes (`-2`, `-3`, etc.). Use `--output-dir` to choose a name.
 
 Prepare one workload and reuse it for both execution paths:
 

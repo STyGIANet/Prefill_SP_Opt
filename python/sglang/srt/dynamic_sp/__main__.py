@@ -135,6 +135,10 @@ def main():
     parser.add_argument(
         "--attention-backend", choices=("gathered", "streaming"), default="gathered"
     )
+    parser.add_argument(
+        "--kv-transport", choices=("targeted", "all_gather"), default="targeted"
+    )
+    parser.add_argument("--shared-attention", choices=("auto", "sdpa"), default="auto")
     parser.add_argument("--kv-block-size", type=int, default=256)
     parser.add_argument("--query-block-size", type=int, default=128)
     parser.add_argument("--verify", action=argparse.BooleanOptionalAction, default=True)
@@ -169,6 +173,9 @@ def main():
             kv_block_size=args.kv_block_size,
             query_block_size=args.query_block_size,
             attention_backend=args.attention_backend,
+            logits_mode="all" if args.verify else "completed",
+            kv_transport=args.kv_transport,
+            shared_attention=args.shared_attention,
         )
 
         def load_input():
@@ -237,7 +244,9 @@ def main():
         if dist.get_rank() == 0:
             print(
                 f"[dynamic-sp] workers={dist.get_world_size()} dtype={args.dtype} "
-                f"backend={args.attention_backend} scheduler={args.scheduler if not args.schedule else 'replay'} verify={args.verify}",
+                f"backend={args.attention_backend} transport={args.kv_transport} "
+                f"shared_attention={args.shared_attention} "
+                f"scheduler={args.scheduler if not args.schedule else 'replay'} verify={args.verify}",
                 flush=True,
             )
             print(

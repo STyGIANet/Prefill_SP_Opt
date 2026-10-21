@@ -30,6 +30,7 @@ from sglang.srt.dynamic_sp.plan import (
     local_positions,
     validate_ranks,
 )
+from torch.nn.attention.bias import causal_lower_right
 
 
 class PrefillModel(Protocol):
@@ -59,6 +60,18 @@ class _State:
     kv: torch.Tensor  # [local_tokens, layers, 2, kv_heads, head_dim]
 
 
+@dataclass
+class _AttentionWorkspace:
+    send: torch.Tensor
+    received: torch.Tensor
+    indices: list[torch.Tensor]
+    key_positions: list[torch.Tensor]
+    packs: list[tuple[_State, int, int]]
+    send_counts: list[int]
+    receive_counts: list[int]
+    shared: bool
+
+
 class PlanRejected(RuntimeError):
     """Every worker rejected the same operation; committed state is unchanged."""
 
@@ -73,6 +86,9 @@ class DynamicSPPrefillEngine:
         kv_block_size: int = 256,
         query_block_size: int = 128,
         attention_backend: str = "gathered",
+        logits_mode: str = "all",
+        kv_transport: str = "targeted",
+        shared_attention: str = "auto",
     ):
         if not dist.is_initialized():
             raise RuntimeError("Initialize torch.distributed before the SP engine")
@@ -86,6 +102,9 @@ class DynamicSPPrefillEngine:
         self.kv_block_size = kv_block_size
         self.query_block_size = query_block_size
         self.attention_backend = attention_backend
+        self.logits_mode = logits_mode
+        self.kv_transport = kv_transport
+        self.shared_attention = shared_attention
         self.metrics = {}
         self._status = torch.zeros(2, dtype=torch.int32, device="cpu")
         self.version = 0
@@ -106,11 +125,20 @@ class DynamicSPPrefillEngine:
                 kv_block_size,
                 query_block_size,
                 attention_backend,
+                logits_mode,
+                kv_transport,
+                shared_attention,
             ),
             "Worker model/configuration mismatch",
         )
 
     def _validate_configuration(self):
+        if self.shared_attention not in ("auto", "sdpa"):
+            raise ValueError("shared_attention must be auto or sdpa")
+        if self.kv_transport not in ("targeted", "all_gather"):
+            raise ValueError("kv_transport must be targeted or all_gather")
+        if self.logits_mode not in ("all", "completed"):
+            raise ValueError("logits_mode must be all or completed")
         m = self.model
         if self.attention_backend not in ("gathered", "streaming"):
             raise ValueError("attention_backend must be gathered or streaming")
@@ -281,6 +309,11 @@ class DynamicSPPrefillEngine:
             "attention_backend": self.attention_backend,
             "kv_collectives": 0,
             "migration_collectives": 0,
+            "logit_collectives": 0,
+            "logits_mode": self.logits_mode,
+            "kv_transport": self.kv_transport,
+            "shared_attention": self.shared_attention,
+            "fused_attention_calls": 0,
         }
         try:
             command = [plan if self.rank == 0 else None]
@@ -436,40 +469,12 @@ class DynamicSPPrefillEngine:
             if self.attention_backend == "gathered"
             else None
         )
-        for layer in range(m.num_layers):
+        if workspace is not None:
+            x = self._prefill_gathered(x, positions, layouts, workspace)
+        for layer in range(0 if workspace is not None else m.num_layers):
 
             def prepare(layer=layer, x=x):
-                if x is None:
-                    q = torch.empty(
-                        (0, m.num_heads, m.head_dim), device=m.device, dtype=m.dtype
-                    )
-                else:
-                    q, k, v = m.prepare(layer, x, positions)
-                    expected_q = (len(positions), m.num_heads, m.head_dim)
-                    expected_kv = (len(positions), m.num_kv_heads, m.head_dim)
-                    if (
-                        q.shape != expected_q
-                        or k.shape != expected_kv
-                        or v.shape != expected_kv
-                    ):
-                        raise ValueError(
-                            "Model projection shapes do not match the declared head layout"
-                        )
-                    if any(
-                        t.dtype != m.dtype or t.device != m.device for t in (q, k, v)
-                    ):
-                        raise ValueError("Model projections changed dtype or device")
-                    for state, prefix_count, begin, end in layouts:
-                        state.kv[prefix_count:, layer, 0].copy_(k[begin:end])
-                        state.kv[prefix_count:, layer, 1].copy_(v[begin:end])
-                if workspace is not None:
-                    send, _, _, _ = workspace
-                    offset = 0
-                    for state, _, _, _ in layouts:
-                        count = len(state.kv)
-                        send[offset : offset + count].copy_(state.kv[:, layer])
-                        offset += count
-                    return q
+                q = self._project_layer(layer, x, positions, layouts)
                 return [
                     [
                         AttentionAccumulator(
@@ -483,22 +488,6 @@ class DynamicSPPrefillEngine:
                 ]
 
             accumulators = self._checked(f"layer {layer} projections", prepare)
-            if workspace is not None:
-                send, received, _, _ = workspace
-                # NCCL establishes the current-stream dependency before SDPA.
-                # There are no allocations or model callbacks between the
-                # successful projection vote and this collective.
-                dist.all_gather_single(received, send)
-                self.metrics["kv_collectives"] += 1
-                x = self._checked(
-                    f"layer {layer} attention and output",
-                    lambda layer=layer, x=x, accumulators=accumulators: (
-                        self._gathered_complete(
-                            layer, x, accumulators, positions, layouts, workspace
-                        )
-                    ),
-                )
-                continue
             # Buffers are bounded by kv_block_size, independent of prompt length.
             for (state, _, _, _), request_accumulators in zip(layouts, accumulators):
                 for owner in state.ranks:
@@ -563,10 +552,20 @@ class DynamicSPPrefillEngine:
 
             x = self._checked(f"layer {layer} output", complete)
 
+        logit_layouts = [
+            layout
+            for layout in layouts
+            if self.logits_mode == "all"
+            or layout[0].end == len(layout[0].prompt.token_ids)
+        ]
+        self.metrics["logit_requests"] = len(logit_layouts)
+        if not logit_layouts:
+            return {}
+
         def make_logits():
             outputs = {}
             finite_checks = []
-            for state, _, _, end in layouts:
+            for state, _, _, end in logit_layouts:
                 owner = state.ranks[(state.end - 1) % len(state.ranks)]
                 if self.rank == owner:
                     result = (
@@ -583,66 +582,263 @@ class DynamicSPPrefillEngine:
             return outputs
 
         outputs = self._checked("logits", make_logits)
-        for state, _, _, _ in layouts:
+        for state, _, _, _ in logit_layouts:
             owner = state.ranks[(state.end - 1) % len(state.ranks)]
             dist.broadcast(outputs[state.prompt.request_id], src=owner)
+            self.metrics["logit_collectives"] += 1
         self._checked("logits completion", lambda: None)
         return outputs
 
-    def _gather_workspace(self, layouts):
-        """Reusable one-layer workspace; persistent KV ownership is unchanged."""
+    def _project_layer(self, layer, x, positions, layouts, workspace=None):
         m = self.model
+        if x is None:
+            q = torch.empty(
+                (0, m.num_heads, m.head_dim), device=m.device, dtype=m.dtype
+            )
+        else:
+            q, k, v = m.prepare(layer, x, positions)
+            expected_q = (len(positions), m.num_heads, m.head_dim)
+            expected_kv = (len(positions), m.num_kv_heads, m.head_dim)
+            if (
+                q.shape != expected_q
+                or k.shape != expected_kv
+                or v.shape != expected_kv
+            ):
+                raise ValueError(
+                    "Model projection shapes do not match the declared head layout"
+                )
+            if any(t.dtype != m.dtype or t.device != m.device for t in (q, k, v)):
+                raise ValueError("Model projections changed dtype or device")
+            for state, prefix_count, begin, end in layouts:
+                state.kv[prefix_count:, layer, 0].copy_(k[begin:end])
+                state.kv[prefix_count:, layer, 1].copy_(v[begin:end])
+        if workspace is not None:
+            for state, begin, end in workspace.packs:
+                workspace.send[begin:end].copy_(state.kv[:, layer])
+        return q
+
+    def _prefill_gathered(self, x, positions, layouts, workspace):
+        if not workspace.shared:
+            # No transport occurs inside this region. A local failure can skip
+            # subsequent layers safely; all ranks vote before logits or commit.
+            def local_layers():
+                hidden = x
+                for layer in range(self.model.num_layers):
+                    q = self._project_layer(
+                        layer, hidden, positions, layouts, workspace
+                    )
+                    hidden = self._gathered_complete(
+                        layer, hidden, q, positions, layouts, workspace
+                    )
+                return hidden
+
+            return self._checked("private layers", local_layers)
+
+        q = self._checked(
+            "layer 0 projections",
+            lambda: self._project_layer(0, x, positions, layouts, workspace),
+        )
+        for layer in range(self.model.num_layers):
+            # Every allocation, pack and model callback precedes a successful
+            # collective vote. Idle ranks enter this transport with zero splits.
+            if self.kv_transport == "targeted":
+                dist.all_to_all_single(
+                    workspace.received,
+                    workspace.send,
+                    output_split_sizes=workspace.receive_counts,
+                    input_split_sizes=workspace.send_counts,
+                )
+            else:
+                dist.all_gather_single(workspace.received, workspace.send)
+            self.metrics["kv_collectives"] += 1
+
+            def complete_and_prepare(layer=layer, x=x, q=q):
+                hidden = self._gathered_complete(
+                    layer, x, q, positions, layouts, workspace
+                )
+                next_q = (
+                    self._project_layer(
+                        layer + 1, hidden, positions, layouts, workspace
+                    )
+                    if layer + 1 < self.model.num_layers
+                    else None
+                )
+                return hidden, next_q
+
+            # Merge adjacent local phases, retaining a rejection point before
+            # every transport. A failed output or next projection cannot strand
+            # peers in the following collective or modify committed KV.
+            x, q = self._checked(
+                f"layer {layer} output and next projections", complete_and_prepare
+            )
+        return x
+
+    def _gather_workspace(self, layouts):
+        """Pack shared KV only for destinations with new queries for that prompt."""
+        m = self.model
+        shared = [len(state.ranks) > 1 for state, _, _, _ in layouts]
         counts = [
-            [len(local_positions(s.end, s.ranks, rank)) for s, _, _, _ in layouts]
+            [
+                len(local_positions(s.end, s.ranks, rank)) if shared[i] else 0
+                for i, (s, _, _, _) in enumerate(layouts)
+            ]
             for rank in range(self.world_size)
         ]
-        stride = max(map(sum, counts))
-        shape = (stride, 2, m.num_kv_heads, m.head_dim)
-        # Zero padding avoids exposing uninitialized memory to other workers.
-        send = torch.zeros(shape, device=m.device, dtype=m.dtype)
-        received = torch.empty(
-            (self.world_size * stride, *shape[1:]), device=m.device, dtype=m.dtype
-        )
-        offsets = [0] * self.world_size
-        indices, key_positions = [], []
-        for request, (state, _, begin, end) in enumerate(layouts):
-            # Positions p belong to ranks[p % degree], at local offset p // degree.
-            # Only workers computing queries need a full request index map.
+        consumers = []
+        for state, _, _, _ in layouts:
+            # An advancing strided suffix ends at state.end. Recover its global
+            # start from this rank's prefix count only via the original state.
+            old = self._states.get(state.prompt.request_id)
+            start = old.end if old is not None else 0
+            consumers.append(
+                {
+                    rank
+                    for rank in state.ranks
+                    if len(local_positions(state.end, state.ranks, rank))
+                    > len(local_positions(start, state.ranks, rank))
+                }
+            )
+        packs, indices, key_positions = [], [], []
+        send_counts = [0] * self.world_size
+        receive_counts = [0] * self.world_size
+        offsets = [[0] * len(layouts) for _ in range(self.world_size)]
+        if self.kv_transport == "targeted":
+            cursor = 0
+            for dest in range(self.world_size):
+                for i, (state, _, _, _) in enumerate(layouts):
+                    count = counts[self.rank][i] if dest in consumers[i] else 0
+                    if count:
+                        packs.append((state, cursor, cursor + count))
+                        cursor += count
+                        send_counts[dest] += count
+            send_rows = cursor
+            cursor = 0
+            for source in range(self.world_size):
+                for i in range(len(layouts)):
+                    offsets[source][i] = cursor
+                    count = counts[source][i] if self.rank in consumers[i] else 0
+                    cursor += count
+                    receive_counts[source] += count
+            receive_rows = cursor
+        else:
+            stride = max(map(sum, counts))
+            send_rows, receive_rows = stride, self.world_size * stride
+            for source in range(self.world_size):
+                cursor = source * stride
+                for i, (state, _, _, _) in enumerate(layouts):
+                    offsets[source][i] = cursor
+                    count = counts[source][i]
+                    if source == self.rank and count:
+                        packs.append(
+                            (
+                                state,
+                                cursor - source * stride,
+                                cursor - source * stride + count,
+                            )
+                        )
+                    cursor += count
+        shape = (2, m.num_kv_heads, m.head_dim)
+        send = torch.zeros((send_rows, *shape), device=m.device, dtype=m.dtype)
+        received = torch.empty((receive_rows, *shape), device=m.device, dtype=m.dtype)
+        for i, (state, _, begin, end) in enumerate(layouts):
             mapping = (
                 [
-                    state.ranks[p % len(state.ranks)] * stride
-                    + offsets[state.ranks[p % len(state.ranks)]]
+                    offsets[state.ranks[p % len(state.ranks)]][i]
                     + p // len(state.ranks)
                     for p in range(state.end)
                 ]
-                if begin != end
+                if begin != end and shared[i]
                 else []
             )
             indices.append(torch.tensor(mapping, device=m.device, dtype=torch.long))
             key_positions.append(
-                torch.arange(state.end if begin != end else 0, device=m.device)
+                torch.arange(
+                    state.end if begin != end and shared[i] else 0, device=m.device
+                )
             )
-            for rank in range(self.world_size):
-                offsets[rank] += counts[rank][request]
         self.metrics["gather_workspace_bytes"] = (
             send.numel() + received.numel()
         ) * send.element_size()
-        return send, received, indices, key_positions
+        self.metrics["kv_send_bytes_per_layer"] = send.numel() * send.element_size()
+        self.metrics["kv_receive_bytes_per_layer"] = (
+            received.numel() * received.element_size()
+        )
+        self.metrics["shared_kv_rows"] = sum(map(sum, counts))
+        self.metrics["private_kv_rows"] = sum(
+            state.end for state, _, _, _ in layouts if len(state.ranks) == 1
+        )
+        return _AttentionWorkspace(
+            send,
+            received,
+            indices,
+            key_positions,
+            packs,
+            send_counts,
+            receive_counts,
+            any(shared),
+        )
 
     def _gathered_complete(self, layer, x, q, positions, layouts, workspace):
         if x is None:
             return None
         m = self.model
-        _, received, indices, key_positions = workspace
+        received, indices, key_positions = (
+            workspace.received,
+            workspace.indices,
+            workspace.key_positions,
+        )
         output = torch.empty_like(q)
-        for request, (_, _, begin, end) in enumerate(layouts):
+        for request, (state, prefix_count, begin, end) in enumerate(layouts):
             if begin == end:
                 continue
-            kv = received.index_select(0, indices[request])
+            private = len(state.ranks) == 1
+            kv = (
+                state.kv[:, layer]
+                if private
+                else received.index_select(0, indices[request])
+            )
+            if (
+                not private
+                and self.shared_attention == "auto"
+                and q.device.type == "cuda"
+                and q.dtype in (torch.float16, torch.bfloat16)
+                and m.head_dim <= 256
+            ):
+                from sglang.srt.dynamic_sp.fused_attention import (
+                    strided_causal_attention,
+                )
+
+                output[begin:end].copy_(
+                    strided_causal_attention(
+                        q[begin:end],
+                        kv[:, 0],
+                        kv[:, 1],
+                        first_query=prefix_count * len(state.ranks)
+                        + state.ranks.index(self.rank),
+                        query_stride=len(state.ranks),
+                    )
+                )
+                self.metrics["fused_attention_calls"] += 1
+                continue
             k = kv[:, 0].transpose(0, 1).unsqueeze(0)
             v = kv[:, 1].transpose(0, 1).unsqueeze(0)
             for offset in range(begin, end, self.query_block_size):
                 stop = min(offset + self.query_block_size, end)
+                if private:
+                    # Queries form a contiguous suffix of this key prefix. A
+                    # lower-right causal bias permits fused SDPA without a dense
+                    # mask. Truncate keys to this query block's final position.
+                    key_end = prefix_count + stop - begin
+                    attended = F.scaled_dot_product_attention(
+                        q[offset:stop].transpose(0, 1).unsqueeze(0),
+                        k[:, :, :key_end],
+                        v[:, :, :key_end],
+                        attn_mask=causal_lower_right(stop - offset, key_end),
+                        dropout_p=0.0,
+                        enable_gqa=m.num_heads != m.num_kv_heads,
+                    )
+                    output[offset:stop].copy_(attended.squeeze(0).transpose(0, 1))
+                    continue
                 visible = (
                     key_positions[request][None, :] <= positions[offset:stop, None]
                 )
