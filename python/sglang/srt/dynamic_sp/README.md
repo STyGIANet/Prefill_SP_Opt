@@ -236,11 +236,6 @@ default with absolute and relative tolerances of `1e-4`. These tolerances are
 not automatically relaxed for BF16; use FP32 for the initial correctness check
 and assess reduced precision separately.
 
-Run directories use UTC timestamps, for example
-`work/dynamic-sp-8gpu-2026-10-20_19-30-00Z` or
-`work/sglang-dp-8gpu-2026-10-20_19-30-00Z`. Simultaneous launches receive
-numeric suffixes (`-2`, `-3`, etc.). Use `--output-dir` to choose a name.
-
 Prepare one workload and reuse it for both execution paths:
 
 ```bash

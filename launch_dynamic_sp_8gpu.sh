@@ -62,7 +62,7 @@ Options:
   --max-running-requests N  Resident requests: global SP, per-worker DP (default: 32)
   --max-batch-tokens N   SP new-token budget per step (default: 32768)
   --seed N              Seed for optional trace export (default: 0)
-  --output-dir PATH     Fresh directory (default: work/<sp-or-dp>-8gpu-<UTC timestamp>)
+  --output-dir PATH     Fresh directory for workload, manifest, logs, and results
   --workload-dir PATH   Reuse prepared workload and manifest for a matched comparison
   --prepare-only        Download and prepare data without launching workers
   --no-verify           Disable the SP unsharded reference comparison
@@ -138,24 +138,8 @@ print(f"[dynamic-sp] Found {torch.cuda.device_count()} visible GPUs; using eight
 PY
 fi
 if [[ -z "$output_dir" ]]; then
-    run_root="${repo_root}/python/sglang/srt/dynamic_sp/work"
-    mkdir -p "$run_root" || exit 1
-    run_kind="dynamic-sp"
-    if [[ "$scheduler" == "sglang-dp" ]]; then
-        run_kind="sglang-dp"
-    fi
-    run_base="${run_root}/${run_kind}-8gpu-$(date -u +%Y-%m-%d_%H-%M-%SZ)"
-    output_dir="$run_base"
-    run_number=1
-    # Atomic creation also handles simultaneous launches within the same second.
-    while ! mkdir "$output_dir" 2>/dev/null; do
-        if [[ ! -e "$output_dir" ]]; then
-            printf 'Cannot create run directory: %s\n' "$output_dir" >&2
-            exit 1
-        fi
-        run_number=$((run_number + 1))
-        output_dir="${run_base}-${run_number}"
-    done
+    mkdir -p "${repo_root}/python/sglang/srt/dynamic_sp/work"
+    output_dir="$(mktemp -d "${repo_root}/python/sglang/srt/dynamic_sp/work/dynamic-sp-8gpu.XXXXXXXX")"
 fi
 mkdir -p "$output_dir"
 show_logs() {
