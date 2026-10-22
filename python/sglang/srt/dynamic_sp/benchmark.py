@@ -179,7 +179,7 @@ def main():
             "Matrix mode accepts named launcher options, not raw runner overrides"
         )
     schedulers = (
-        ["greedy", "tetris", "loongserve"]
+        ["greedy", "request", "tetris", "loongserve"]
         if args.scheduler == "all"
         else [args.scheduler]
     )

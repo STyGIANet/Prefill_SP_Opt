@@ -99,7 +99,9 @@ Options:
   --arrival-seed N      Reproducible arrival RNG seed (default: 0)
   --arrival-pattern P   poisson (default) or burst for saturation tests
   --execution-mode MODE async (default) or sync SP execution
-  --scheduler NAME      all SP schedulers (default), greedy, tetris, loongserve, or module:factory
+  --scheduler NAME      all SP schedulers (default), greedy, request, tetris, loongserve, or module:factory
+  --sp-sizes LIST        Request scheduler block sizes, e.g. 1,2,4,8
+  --size-thresholds LIST Request scheduler length thresholds, e.g. 256,1024,4096
   --recalibrate-loongserve  Explicitly run new GPU calibration (default: reuse compatible profile)
   --loongserve-profile PATH  Reuse a frozen LoongServe batch latency profile
   --loongserve-samples PATH  Fit existing full-batch GPU measurements
@@ -167,7 +169,7 @@ while (($#)); do
         --eval-length-mode) set -- --length-mode "${@:2}" ;;
     esac
     case "$1" in
-        --loongserve-calibration-concurrency|--loongserve-calibration-grid|--loongserve-profile|--loongserve-samples|--loongserve-max-prefill-seconds|--loongserve-calibration-lengths|--progress-interval|--datasets|--attention-backends|--kv-transports|--repeats|--warmup-tokens|--warmup-requests|--tetris-fit-method|--execution-mode|--workload-dir|--python|--model|--dataset|--dataset-config|--split|--num-prompts|--input-tokens|--chunk-tokens|--max-local-tokens|--output-dir|--model-revision|--dataset-revision|--text-column|--seed|--dtype|--attention-backend|--scheduler|--max-running-requests|--max-batch-tokens|--offered-load|--arrival-seed|--arrival-pattern|--length-mode|--tetris-profile|--fit-dataset|--fit-split|--fit-dataset-config|--fit-dataset-revision|--fit-text-column|--fit-num-prompts|--fit-input-tokens|--fit-length-mode|--tetris-samples|--tetris-loads|--tetris-objective|--tetris-simulation-requests|--kv-transport|--shared-attention)
+        --loongserve-calibration-concurrency|--loongserve-calibration-grid|--loongserve-profile|--loongserve-samples|--loongserve-max-prefill-seconds|--loongserve-calibration-lengths|--progress-interval|--datasets|--attention-backends|--kv-transports|--repeats|--warmup-tokens|--warmup-requests|--tetris-fit-method|--execution-mode|--workload-dir|--python|--model|--dataset|--dataset-config|--split|--num-prompts|--input-tokens|--chunk-tokens|--max-local-tokens|--output-dir|--model-revision|--dataset-revision|--text-column|--seed|--dtype|--attention-backend|--scheduler|--max-running-requests|--max-batch-tokens|--offered-load|--arrival-seed|--arrival-pattern|--length-mode|--tetris-profile|--fit-dataset|--fit-split|--fit-dataset-config|--fit-dataset-revision|--fit-text-column|--fit-num-prompts|--fit-input-tokens|--fit-length-mode|--tetris-samples|--tetris-loads|--tetris-objective|--tetris-simulation-requests|--kv-transport|--shared-attention|--sp-sizes|--size-thresholds)
             if (($# < 2)) || [[ -z "$2" || "$2" == --* ]]; then
                 printf 'Missing value for %s\n' "$1" >&2; exit 2
             fi
@@ -180,6 +182,7 @@ while (($#)); do
                 --loongserve-calibration-lengths) loongserve_calibration_lengths="$2" ;;
                 --datasets|--attention-backends|--kv-transports|--repeats) matrix=1 ;;
                 --progress-interval) runner_args+=(--progress-interval "$2") ;;
+                --sp-sizes|--size-thresholds) runner_args+=("$1" "$2") ;;
                 --warmup-tokens) warmup_tokens="$2" ;;
                 --warmup-requests) warmup_requests="$2" ;;
                 --tetris-fit-method) tetris_fit_method="$2" ;;

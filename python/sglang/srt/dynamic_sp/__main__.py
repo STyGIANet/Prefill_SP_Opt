@@ -109,6 +109,11 @@ def read_schedule(path):
     ]
 
 
+# Tetris Implementation
+def _parse_ints(text):
+    return tuple(int(v) for v in text.split(","))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
@@ -144,7 +149,17 @@ def main():
     parser.add_argument(
         "--scheduler",
         default="greedy",
-        help="greedy, tetris, loongserve, or module:factory taking SchedulerConfig",
+        help="greedy, request, tetris, loongserve, or module:factory taking SchedulerConfig",
+    )
+    parser.add_argument(
+        "--sp-sizes",
+        type=_parse_ints,
+        help="Comma-separated aligned block sizes for --scheduler request (default: powers of two)",
+    )
+    parser.add_argument(
+        "--size-thresholds",
+        type=_parse_ints,
+        help="Comma-separated prompt lengths switching to the next --sp-sizes block",
     )
     parser.add_argument(
         "--tetris-profile",
@@ -273,6 +288,12 @@ def main():
             )
             if args.scheduler == "greedy":
                 policy = GreedyScheduler(config)
+            elif args.scheduler == "request":
+                from sglang.srt.dynamic_sp.dynamic_scheduler import RequestSpScheduler
+
+                policy = RequestSpScheduler(
+                    config, args.sp_sizes, args.size_thresholds
+                )
             elif args.scheduler in ("tetris", "loongserve"):
                 if args.scheduler == "tetris":
                     from sglang.srt.dynamic_sp.tetris import TetrisScheduler
