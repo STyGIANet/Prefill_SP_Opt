@@ -145,7 +145,9 @@ class AsyncScheduler:
             for step in part.steps:
                 self.projected[step.request_id] = step
             estimate = self.last_step_seconds or 0.001
-            if hasattr(self.policy, "models"):
+            if hasattr(self.policy, "estimate_operation_seconds"):
+                estimate = self.policy.estimate_operation_seconds(part)
+            elif hasattr(self.policy, "models"):
                 estimate = sum(
                     self.policy.models[len(s.ranks)].seconds(
                         self.requests[s.request_id].end,

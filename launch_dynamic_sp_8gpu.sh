@@ -47,6 +47,12 @@ verbose=0
 verify_flag="--no-verify"
 prepare_args=()
 runner_args=()
+loongserve_calibration_grid="lean"
+loongserve_calibration_concurrency="parallel"
+loongserve_profile=""
+loongserve_samples=""
+loongserve_max_prefill_seconds=""
+loongserve_calibration_lengths=""
 tetris_profile=""
 tetris_samples=""
 fit_dataset=""
@@ -91,7 +97,13 @@ Options:
   --arrival-seed N      Reproducible arrival RNG seed (default: 0)
   --arrival-pattern P   poisson (default) or burst for saturation tests
   --execution-mode MODE async (default) or sync SP execution
-  --scheduler NAME      all SP schedulers (default), greedy, tetris, or module:factory
+  --scheduler NAME      all SP schedulers (default), greedy, tetris, loongserve, or module:factory
+  --loongserve-profile PATH  Reuse a frozen LoongServe batch latency profile
+  --loongserve-samples PATH  Fit existing full-batch GPU measurements
+  --loongserve-max-prefill-seconds S  Admission limit (profile value; new profiles: 0.5s)
+  --loongserve-calibration-concurrency parallel|serial  Disjoint profiling groups (default: parallel)
+  --loongserve-calibration-grid lean|full  Sparse default or exhaustive profiling
+  --loongserve-calibration-lengths "N ..."  Absolute lengths override (default: lengths scale with SP degree)
   --tetris-profile PATH  Reuse a frozen profile; skips all Tetris fitting
   --fit-dataset ID       Independent dataset for Tetris threshold selection
   --fit-split NAME       Fitting partition (default: train)
@@ -151,11 +163,17 @@ while (($#)); do
         --eval-length-mode) set -- --length-mode "${@:2}" ;;
     esac
     case "$1" in
-        --progress-interval|--datasets|--attention-backends|--kv-transports|--repeats|--warmup-tokens|--warmup-requests|--tetris-fit-method|--execution-mode|--workload-dir|--python|--model|--dataset|--dataset-config|--split|--num-prompts|--input-tokens|--chunk-tokens|--max-local-tokens|--output-dir|--model-revision|--dataset-revision|--text-column|--seed|--dtype|--attention-backend|--scheduler|--max-running-requests|--max-batch-tokens|--offered-load|--arrival-seed|--arrival-pattern|--length-mode|--tetris-profile|--fit-dataset|--fit-split|--fit-dataset-config|--fit-dataset-revision|--fit-text-column|--fit-num-prompts|--fit-input-tokens|--fit-length-mode|--tetris-samples|--tetris-loads|--tetris-objective|--tetris-simulation-requests|--kv-transport|--shared-attention)
+        --loongserve-calibration-concurrency|--loongserve-calibration-grid|--loongserve-profile|--loongserve-samples|--loongserve-max-prefill-seconds|--loongserve-calibration-lengths|--progress-interval|--datasets|--attention-backends|--kv-transports|--repeats|--warmup-tokens|--warmup-requests|--tetris-fit-method|--execution-mode|--workload-dir|--python|--model|--dataset|--dataset-config|--split|--num-prompts|--input-tokens|--chunk-tokens|--max-local-tokens|--output-dir|--model-revision|--dataset-revision|--text-column|--seed|--dtype|--attention-backend|--scheduler|--max-running-requests|--max-batch-tokens|--offered-load|--arrival-seed|--arrival-pattern|--length-mode|--tetris-profile|--fit-dataset|--fit-split|--fit-dataset-config|--fit-dataset-revision|--fit-text-column|--fit-num-prompts|--fit-input-tokens|--fit-length-mode|--tetris-samples|--tetris-loads|--tetris-objective|--tetris-simulation-requests|--kv-transport|--shared-attention)
             if (($# < 2)) || [[ -z "$2" || "$2" == --* ]]; then
                 printf 'Missing value for %s\n' "$1" >&2; exit 2
             fi
             case "$1" in
+                --loongserve-calibration-concurrency) loongserve_calibration_concurrency="$2" ;;
+                --loongserve-calibration-grid) loongserve_calibration_grid="$2" ;;
+                --loongserve-profile) loongserve_profile="$2" ;;
+                --loongserve-samples) loongserve_samples="$2" ;;
+                --loongserve-max-prefill-seconds) loongserve_max_prefill_seconds="$2" ;;
+                --loongserve-calibration-lengths) loongserve_calibration_lengths="$2" ;;
                 --datasets|--attention-backends|--kv-transports|--repeats) matrix=1 ;;
                 --progress-interval) runner_args+=(--progress-interval "$2") ;;
                 --warmup-tokens) warmup_tokens="$2" ;;
@@ -282,9 +300,9 @@ if [[ "$scheduler" == tetris ]] && ((!prepare_only)); then
         exit 2
     fi
 fi
-for path in "$tetris_profile" "$tetris_samples"; do
+for path in "$tetris_profile" "$tetris_samples" "$loongserve_profile" "$loongserve_samples"; do
     if [[ -n "$path" && ! -r "$path" ]]; then
-        printf 'Cannot read Tetris input: %s\n' "$path" >&2; exit 2
+        printf 'Cannot read scheduler profile/samples: %s\n' "$path" >&2; exit 2
     fi
 done
 if [[ -n "$workload_dir" ]]; then
@@ -352,6 +370,43 @@ run_logged() {
         exit 1
     fi
 }
+if [[ "$scheduler" == loongserve ]]; then
+    if [[ "$execution_mode" != async ]]; then
+        printf 'LoongServe requires async execution.\n' >&2; exit 2
+    fi
+    if [[ -n "$loongserve_profile" && -n "$loongserve_samples" ]]; then
+        printf 'Choose a LoongServe profile or samples, not both.\n' >&2; exit 2
+    fi
+    loongserve_dir="$output_dir/loongserve"
+    mkdir -p "$loongserve_dir"
+    if [[ -z "$loongserve_profile" ]]; then
+        if [[ -z "$loongserve_samples" ]]; then
+            loongserve_samples="$loongserve_dir/samples.json"
+            calibration_length_args=()
+            if [[ -n "$loongserve_calibration_lengths" ]]; then
+                read -r -a calibration_lengths <<< "$loongserve_calibration_lengths"
+                calibration_length_args=(--lengths "${calibration_lengths[@]}")
+            fi
+            printf '[dynamic-sp] Calibrating LoongServe SIB; log: %s/calibration.log\n' "$loongserve_dir"
+            run_logged "$loongserve_dir/calibration.log" \
+                "$python_bin" -m torch.distributed.run --standalone --nproc-per-node=8 \
+                -m sglang.srt.dynamic_sp.loongserve_calibrate \
+                --model-path "$model_path" --dtype "$dtype" --attention-backend "$attention_backend" \
+                --kv-transport "$kv_transport" --shared-attention "$shared_attention" "$migration_overlap" \
+                --max-local-tokens "$max_local_tokens" --grid "$loongserve_calibration_grid" --concurrency "$loongserve_calibration_concurrency" "${calibration_length_args[@]}" --output "$loongserve_samples"
+        fi
+        loongserve_profile="$loongserve_dir/profile.json"
+        run_logged "$loongserve_dir/fit.log" \
+            "$python_bin" -m sglang.srt.dynamic_sp.loongserve_profile \
+            --samples "$loongserve_samples" --max-prefill-seconds "${loongserve_max_prefill_seconds:-0.5}" \
+            --output "$loongserve_profile"
+    fi
+    runner_args+=(--loongserve-profile "$loongserve_profile")
+    if [[ -n "$loongserve_max_prefill_seconds" ]]; then
+        runner_args+=(--loongserve-max-prefill-seconds "$loongserve_max_prefill_seconds")
+    fi
+fi
+
 if [[ "$scheduler" == tetris ]]; then
     tetris_dir="$output_dir/tetris"
     mkdir -p "$tetris_dir"

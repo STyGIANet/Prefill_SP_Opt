@@ -32,8 +32,7 @@ prefix endpoint. Advancing from $n$ to $m$ computes positions $[n,m)$; setting $
 prompt pauses it while retaining its KV state. In the online scheduler, releasing an unfinished prompt evicts its KV state and requeues the original 
 input for recomputation. Releasing a completed prompt retires it.
 
-The engine stages KV updates before publishing a new version. Recoverable allocation or model errors raise `PlanRejected` collectively and preserve the 
-previous committed state. Transport failures, process loss, and corrupted CUDA contexts require restarting the worker group.
+The engine stages KV updates before publishing a new version. Operation-boundary checks can reject a plan collectively while preserving committed state. Async prefill phase failures invalidate the run and require worker restart; per-layer recovery votes are omitted. Transport failures, process loss, and corrupted CUDA contexts also require restarting the worker group.
 
 `--execution-mode async` is the default. The coordinator leases the union of old and new KV owners for each operation. Requests connected through 
 shared owners form one transaction; disjoint transactions execute and commit independently. A completed group can accept its next chunk while other 
@@ -94,6 +93,7 @@ The root launcher selects the execution policy with `--scheduler`.
 |---|---|
 | `greedy` | Dynamic SP with the heuristic in `GreedyScheduler.next_plan()` |
 | `tetris` | Latency-model-based chunking and progressive SP expansion |
+| `loongserve` | FCFS admission and compiled dynamic programming over whole-prompt batches |
 | `sglang-dp` | Native SGLang DP replicas, round-robin dispatch, and FCFS scheduling within each replica |
 | `module:factory` | An importable factory that constructs a custom SP policy |
 
@@ -205,7 +205,7 @@ not that every concurrent workload fits physical memory. Staged KV and attention
 ./launch_dynamic_sp_8gpu.sh --offered-load 25000
 ```
 
-The default sweep evaluates PG19, arXiv and GovReport test splits, greedy and Tetris SP schedulers, attention backends `ring gathered streaming`, and 
+The default sweep evaluates PG19, arXiv and GovReport test splits, greedy, Tetris and LoongServe SP schedulers, attention backends `ring gathered streaming`, and 
 transport settings `targeted all_gather`. Native DP is excluded. The script contains commented model and dataset choices. Dataset sources are 
 [PG19](https://huggingface.co/datasets/emozilla/pg19), [arXiv](https://huggingface.co/datasets/ccdv/arxiv-summarization), and 
 [GovReport](https://huggingface.co/datasets/ccdv/govreport-summarization). Natural length variation is preserved; these are empirical corpora, not 
@@ -263,7 +263,7 @@ workload hash, warmup count, profile and execution settings, and failure status.
 saved atomically after every trial. The process exits unsuccessfully if any trial fails. Throughput includes arrival gaps and queueing and is not a 
 saturated-capacity estimate. TTFT ends at committed sampled-token readiness before response IPC and HTTP.
 
-To run a single scheduler with specific settings, use `--scheduler greedy` or `--scheduler tetris` and singular `--attention-backend` / 
+To run a single scheduler with specific settings, use `--scheduler greedy`, `--scheduler tetris`, or `--scheduler loongserve` and singular `--attention-backend` / 
 `--kv-transport` flags. Matrix mode is selected by the default `--scheduler all`, `--datasets`, or plural backend/transport options. `--prepare-only` 
 performs no GPU execution.
 
@@ -288,3 +288,7 @@ The standalone `--scheduler sglang-dp` runner defaults to 600000 KV tokens per w
 the default. DP treats this as requested capacity. After native Engine startup, it checks the tokenizer and reported scheduler capacity limits before 
 starting arrivals.  For `results.json`, it also writes `results.capacity.json` with excluded request IDs and lengths, and `results.workload.json` with 
 the exact evaluated subset and original arrival offsets.
+
+LoongServe uses independent full-batch latency calibration and does not chunk prompts.
+See [LoongServe prefill scheduling](LOONGSERVE.md) for its objective, prefill-only
+reduction, profile reuse and launch options. Select it with `--scheduler loongserve`.

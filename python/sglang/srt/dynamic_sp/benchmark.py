@@ -50,6 +50,7 @@ FIELDS = [
     "verification_enabled",
     "completion_boundary",
     "tetris_profile",
+    "loongserve_profile",
     "profile_attention_backend",
     "profile_kv_transport",
     "result_path",
@@ -152,6 +153,8 @@ def main():
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--output-dir")
     parser.add_argument("--workload-dir")
+    parser.add_argument("--loongserve-profile")
+    parser.add_argument("--loongserve-samples")
     parser.add_argument("--tetris-profile")
     parser.add_argument("--tetris-samples")
     parser.add_argument("--fit-dataset")
@@ -163,7 +166,11 @@ def main():
         parser.error(
             "Matrix mode accepts named launcher options, not raw runner overrides"
         )
-    schedulers = ["greedy", "tetris"] if args.scheduler == "all" else [args.scheduler]
+    schedulers = (
+        ["greedy", "tetris", "loongserve"]
+        if args.scheduler == "all"
+        else [args.scheduler]
+    )
     if "sglang-dp" in schedulers:
         parser.error("This benchmark compares SP schedulers only")
     backends = (
@@ -205,6 +212,8 @@ def main():
     frozen_profile = (
         Path(args.tetris_profile).resolve() if args.tetris_profile else None
     )
+
+    loongserve_profiles = {}
 
     def run(flags, log):
         command = ["bash", launcher, *common, *flags]
@@ -316,6 +325,16 @@ def main():
                         "--output-dir",
                         str(target),
                     ]
+                    if scheduler == "loongserve":
+                        profile = (
+                            Path(args.loongserve_profile).resolve()
+                            if args.loongserve_profile
+                            else loongserve_profiles.get((backend, transport))
+                        )
+                        if profile:
+                            flags += ["--loongserve-profile", str(profile)]
+                        elif args.loongserve_samples:
+                            flags += ["--loongserve-samples", args.loongserve_samples]
                     if scheduler == "tetris":
                         profile = frozen_profile
                         flags += ["--allow-profile-backend-mismatch"]
@@ -339,6 +358,28 @@ def main():
                         flush=True,
                     )
                     status = run(flags, target / "benchmark.log")
+                    if scheduler == "loongserve":
+                        fitted_loongserve = target / "loongserve/profile.json"
+                        if fitted_loongserve.exists():
+                            loongserve_profiles[(backend, transport)] = (
+                                fitted_loongserve
+                            )
+                        selected_profile = (
+                            Path(args.loongserve_profile).resolve()
+                            if args.loongserve_profile
+                            else loongserve_profiles.get((backend, transport))
+                        )
+                        if selected_profile:
+                            calibration = json.loads(selected_profile.read_text())[
+                                "metadata"
+                            ]
+                            row.update(
+                                loongserve_profile=str(selected_profile),
+                                profile_attention_backend=calibration.get(
+                                    "attention_backend"
+                                ),
+                                profile_kv_transport=calibration.get("kv_transport"),
+                            )
                     fitted = target / "tetris/profile.json"
                     if fitted.exists():
                         frozen_profile = fitted

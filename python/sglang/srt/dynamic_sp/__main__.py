@@ -144,12 +144,16 @@ def main():
     parser.add_argument(
         "--scheduler",
         default="greedy",
-        help="greedy, tetris, or module:factory taking SchedulerConfig",
+        help="greedy, tetris, loongserve, or module:factory taking SchedulerConfig",
     )
     parser.add_argument(
         "--tetris-profile",
         help="Fitted latency models and simulated load thresholds JSON",
     )
+    parser.add_argument(
+        "--loongserve-profile", help="LoongServe batch latency SIB JSON"
+    )
+    parser.add_argument("--loongserve-max-prefill-seconds", type=float)
     parser.add_argument("--max-running-requests", type=int, default=32)
     parser.add_argument("--max-batch-tokens", type=int, default=32768)
     parser.add_argument("--max-local-tokens", type=int, default=8192)
@@ -195,6 +199,13 @@ def main():
         parser.error("tolerances must be finite and nonnegative")
     if args.scheduler == "tetris" and not args.tetris_profile and not args.schedule:
         parser.error("--scheduler tetris requires --tetris-profile")
+    if args.scheduler == "loongserve":
+        if not args.loongserve_profile and not args.schedule:
+            parser.error("--scheduler loongserve requires --loongserve-profile")
+        if args.execution_mode != "async":
+            parser.error(
+                "LoongServe requires async execution for independently completing batches"
+            )
     if not math.isfinite(args.async_timeout) or args.async_timeout <= 0:
         parser.error("async-timeout must be finite and positive")
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -238,12 +249,12 @@ def main():
 
         profile_gpu_names = (
             engine._all_objects(torch.cuda.get_device_name(local_rank))
-            if args.scheduler == "tetris" and args.device == "cuda"
+            if args.scheduler in ("tetris", "loongserve") and args.device == "cuda"
             else None
         )
 
         profile_nodes = None
-        if args.scheduler == "tetris":
+        if args.scheduler in ("tetris", "loongserve"):
             hosts = engine._all_objects(socket.gethostname())
             unique_hosts = list(dict.fromkeys(hosts))
             profile_nodes = [unique_hosts.index(host) for host in hosts]
@@ -262,13 +273,22 @@ def main():
             )
             if args.scheduler == "greedy":
                 policy = GreedyScheduler(config)
-            elif args.scheduler == "tetris":
-                from sglang.srt.dynamic_sp.tetris import TetrisScheduler
+            elif args.scheduler in ("tetris", "loongserve"):
+                if args.scheduler == "tetris":
+                    from sglang.srt.dynamic_sp.tetris import TetrisScheduler
 
-                policy = TetrisScheduler.from_file(config, args.tetris_profile)
+                    policy = TetrisScheduler.from_file(config, args.tetris_profile)
+                else:
+                    from sglang.srt.dynamic_sp.loongserve import LoongServeScheduler
+
+                    policy = LoongServeScheduler.from_file(
+                        config,
+                        args.loongserve_profile,
+                        args.loongserve_max_prefill_seconds,
+                    )
                 if policy.profile["nodes"] != profile_nodes:
                     raise ValueError(
-                        "Tetris profile topology does not match the current rank-to-node mapping"
+                        "Scheduler profile topology does not match the current rank-to-node mapping"
                     )
                 metadata = policy.profile.get("metadata", {})
                 for key, value in (
@@ -289,7 +309,7 @@ def main():
                         continue
                     if metadata.get(key) != value:
                         raise ValueError(
-                            f"Tetris profile {key}={metadata.get(key)!r} does not match {value!r}"
+                            f"Scheduler profile {key}={metadata.get(key)!r} does not match {value!r}"
                         )
             else:
                 module, name = args.scheduler.rsplit(":", 1)

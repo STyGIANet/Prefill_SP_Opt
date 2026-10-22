@@ -22,7 +22,11 @@ from sglang.srt.dynamic_sp.scheduler import GreedyScheduler, SchedulerConfig
 def run_async(args, model, control, scheduler, arrivals, plans):
     options = {
         "max_local_tokens": args.max_local_tokens,
-        "memory_execution_tokens": args.max_batch_tokens,
+        "memory_execution_tokens": (
+            args.max_local_tokens
+            if args.scheduler == "loongserve"
+            else args.max_batch_tokens
+        ),
         "kv_block_size": args.kv_block_size,
         "query_block_size": args.query_block_size,
         "attention_backend": args.attention_backend,
