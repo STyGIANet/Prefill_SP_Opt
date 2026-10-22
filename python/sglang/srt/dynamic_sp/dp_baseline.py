@@ -33,13 +33,59 @@ def read_workload(path):
     return sorted(requests, key=lambda r: r["arrival_time_seconds"])
 
 
-async def benchmark(engine, requests):
+async def benchmark(
+    engine, requests, *, progress_interval=10.0, progress_throughput_target=0.0
+):
     """Open-loop arrivals: submit without waiting for earlier completions."""
     origin = time.perf_counter()
+    completed = []
+    submitted = completed_tokens = 0
+    peak_rate = 0.0
+
+    def show_progress():
+        nonlocal peak_rate
+        elapsed = time.perf_counter() - origin
+        duration = max(0.0, elapsed - requests[0]["arrival_time_seconds"])
+        rate = completed_tokens / duration if duration > 0 else 0.0
+        peak_rate = max(peak_rate, rate)
+        scale = progress_throughput_target or peak_rate
+        reference = "offered_load" if progress_throughput_target else "observed_peak"
+
+        def bar(fraction):
+            filled = max(0, min(16, int(16 * fraction)))
+            return "[" + "#" * filled + "-" * (16 - filled) + "]"
+
+        latencies = sorted(r["ttft_seconds"] for r in completed)
+        p50 = f"{statistics.median(latencies):.3f}s" if latencies else "n/a"
+        p95 = (
+            f"{latencies[math.ceil(0.95 * len(latencies)) - 1]:.3f}s"
+            if latencies
+            else "n/a"
+        )
+        print(
+            f"[dynamic-sp] progress {bar(len(completed) / len(requests))} baseline=sglang-dp "
+            f"prompts={len(completed)}/{len(requests)} elapsed={elapsed:.1f}s "
+            f"outstanding={submitted - len(completed)} not_arrived={len(requests) - submitted} "
+            f"completed_input_tokens={completed_tokens}",
+            flush=True,
+        )
+        print(
+            f"[dynamic-sp] throughput {bar(rate / scale if scale > 0 else 0)} "
+            f"completed_input_tokens/sec={rate:.1f} {reference}_tokens/sec={scale:.1f} "
+            f"TTFT_p50={p50} TTFT_p95={p95} completed_prompts={len(completed)}",
+            flush=True,
+        )
+
+    async def report_progress():
+        while True:
+            show_progress()
+            await asyncio.sleep(progress_interval)
 
     async def submit(request):
+        nonlocal submitted, completed_tokens
         scheduled = origin + request["arrival_time_seconds"]
         dispatched = time.perf_counter()
+        submitted += 1
         result = await engine.async_generate(
             input_ids=request["token_ids"],
             sampling_params={"temperature": 0, "max_new_tokens": 1, "ignore_eos": True},
@@ -59,7 +105,7 @@ async def benchmark(engine, requests):
             raise RuntimeError(
                 "Missing or invalid scheduler first-token timestamp; use this checkout's native Engine"
             )
-        return {
+        record = {
             "request_id": request["request_id"],
             "input_tokens": len(request["token_ids"]),
             "arrival_time_seconds": request["arrival_time_seconds"],
@@ -73,7 +119,12 @@ async def benchmark(engine, requests):
             "output_ids": result.get("output_ids"),
         }
 
+        completed.append(record)
+        completed_tokens += record["input_tokens"]
+        return record
+
     tasks = []
+    reporter = asyncio.create_task(report_progress()) if progress_interval > 0 else None
     try:
         for request in requests:
             delay = origin + request["arrival_time_seconds"] - time.perf_counter()
@@ -81,7 +132,12 @@ async def benchmark(engine, requests):
                 await asyncio.sleep(delay)
             tasks.append(asyncio.create_task(submit(request)))
         results = await asyncio.gather(*tasks)
+        if reporter is not None:
+            show_progress()
     finally:
+        if reporter is not None:
+            reporter.cancel()
+            await asyncio.gather(reporter, return_exceptions=True)
         for task in tasks:
             if not task.done():
                 task.cancel()
@@ -113,6 +169,66 @@ async def benchmark(engine, requests):
     }
 
 
+def prepare_runtime_workload(engine, requests, args):
+    """Filter whole records using actual per-replica limits before arrivals start."""
+    infos = engine._scheduler_init_result.scheduler_infos
+    # Native admission rejects input length >= max_req_input_len. Include the
+    # tokenizer-side limit and every reported replica, not just the requested cap.
+    limits = [args.max_local_tokens - 1, engine.tokenizer_manager.max_req_input_len - 1]
+    for info in infos:
+        limits.extend((info["max_req_input_len"] - 1, info["max_total_num_tokens"] - 1))
+    maximum = min(limits)
+    kept, excluded = [], []
+    for request in requests:
+        count = len(request["token_ids"])
+        if count <= maximum:
+            kept.append(request)
+        else:
+            excluded.append(
+                {
+                    "request_id": request["request_id"],
+                    "input_tokens": count,
+                    "reason": "exceeds_runtime_dp_capacity",
+                }
+            )
+    output = Path(args.output)
+    workload_path = output.with_name(output.stem + ".workload.json")
+    report = {
+        "max_accepted_input_tokens": maximum,
+        "requested_kv_tokens_per_worker": args.max_local_tokens,
+        "source_prompts": len(requests),
+        "evaluated_prompts": len(kept),
+        "excluded_prompts": len(excluded),
+        "excluded_records": excluded,
+        "evaluated_workload": str(workload_path),
+        "arrival_policy": "Original scheduled arrival offsets preserved",
+        "source_workload_sha256": hashlib.sha256(
+            Path(args.workload).read_bytes()
+        ).hexdigest(),
+    }
+    data = (
+        (json.dumps(kept) + "\n").encode()
+        if excluded
+        else Path(args.workload).read_bytes()
+    )
+    workload_path.write_bytes(data)
+    report["evaluated_workload_sha256"] = hashlib.sha256(data).hexdigest()
+    output.with_name(output.stem + ".capacity.json").write_text(
+        json.dumps(report, indent=2) + "\n"
+    )
+    print(
+        f"[dynamic-sp] DP runtime input limit={maximum} tokens; "
+        f"accepted={len(kept)}/{len(requests)} excluded={len(excluded)}; "
+        f"no truncation; comparison workload: {workload_path}",
+        flush=True,
+    )
+    if not kept:
+        raise ValueError(
+            "No complete prompt fits the native DP runtime capacity; see capacity report"
+        )
+    return kept, report
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
@@ -123,11 +239,18 @@ def main():
         "--dtype", default="bfloat16", choices=("float32", "bfloat16", "float16")
     )
     parser.add_argument("--chunk-size", type=int, default=1024)
-    parser.add_argument("--max-local-tokens", type=int, default=65536)
+    parser.add_argument("--max-local-tokens", type=int, default=600000)
     parser.add_argument(
         "--max-running-requests", type=int, default=32, help="Per DP worker"
     )
+    parser.add_argument("--progress-interval", type=float, default=10.0)
+    parser.add_argument("--progress-throughput-target", type=float, default=0.0)
     args = parser.parse_args()
+    if any(
+        not math.isfinite(v) or v < 0
+        for v in (args.progress_interval, args.progress_throughput_target)
+    ):
+        parser.error("Progress interval and target must be finite and nonnegative")
     if (
         min(
             args.dp_size,
@@ -141,8 +264,6 @@ def main():
     if Path(args.output).exists():
         parser.error("Choose a fresh results path")
     requests = read_workload(args.workload)
-    if max(len(r["token_ids"]) for r in requests) + 1 > args.max_local_tokens:
-        parser.error("Each prompt plus its output token must fit on one worker")
 
     from sglang.srt.entrypoints.engine import Engine
 
@@ -164,11 +285,19 @@ def main():
     }
     engine = Engine(**settings)
     try:
-        results = engine.loop.run_until_complete(benchmark(engine, requests))
+        requests, capacity = prepare_runtime_workload(engine, requests, args)
+        results = engine.loop.run_until_complete(
+            benchmark(
+                engine,
+                requests,
+                progress_interval=args.progress_interval,
+                progress_throughput_target=args.progress_throughput_target,
+            )
+        )
+        results["capacity_filter"] = capacity
+        results["source_workload_sha256"] = capacity["source_workload_sha256"]
         results["engine_settings"] = settings
-        results["workload_sha256"] = hashlib.sha256(
-            Path(args.workload).read_bytes()
-        ).hexdigest()
+        results["workload_sha256"] = capacity["evaluated_workload_sha256"]
         Path(args.output).write_text(json.dumps(results, indent=2) + "\n")
         summary = results["summary"]
         print(

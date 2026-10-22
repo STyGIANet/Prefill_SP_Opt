@@ -19,6 +19,7 @@ class AsyncScheduler:
         self.next_ticket = 0
         self.inflight = {}
         self.projected = {}
+        self.releasing = set()
         self.predicted_finish = {}
         self.last_step_seconds = None
         if hasattr(policy, "execution_mode"):
@@ -36,7 +37,16 @@ class AsyncScheduler:
             ranks = (
                 self.projected[rid].ranks if rid in self.projected else request.ranks
             )
-            views.append(replace(request, ranks=ranks, in_flight=rid in self.inflight))
+            views.append(
+                replace(
+                    request,
+                    ranks=() if rid in self.releasing else ranks,
+                    reserved_end=self.projected[rid].end
+                    if rid in self.projected
+                    else None,
+                    in_flight=rid in self.inflight,
+                )
+            )
         available = tuple(
             max(now, self.predicted_finish.get(r, now))
             for r in range(self.config.world_size)
@@ -74,6 +84,8 @@ class AsyncScheduler:
         # KV capacity, including the target states reserved by in-flight work.
         states = {}
         for rid, request in self.requests.items():
+            if rid in self.releasing:
+                continue
             projected = self.projected.get(rid)
             ranks = projected.ranks if projected else request.ranks
             end = projected.end if projected else request.end
@@ -129,6 +141,7 @@ class AsyncScheduler:
             self.next_ticket += 1
             for rid in ids:
                 self.inflight[rid] = op.ticket
+            self.releasing.update(part.release)
             for step in part.steps:
                 self.projected[step.request_id] = step
             estimate = self.last_step_seconds or 0.001
@@ -165,6 +178,7 @@ class AsyncScheduler:
                     last_scheduled_version=self.version,
                 )
             self.last_step_seconds = max(r["seconds"] for r in responses)
+        self.releasing.difference_update(ids)
         for rid in ids:
             self.inflight.pop(rid)
             self.projected.pop(rid, None)

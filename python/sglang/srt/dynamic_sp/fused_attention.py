@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inference-only tiled causal attention for cyclic sequence shards.
 
-Query i has absolute position first_query + i * query_stride. Gathered keys
-are ordered by absolute position. The kernel fuses masking and online softmax,
+Query i has absolute position first_query + i * query_stride. Optional device
+slot maps translate logical key positions to physical pool/receive-buffer rows.
+The kernel fuses indexed loads, masking and online softmax,
 uses FP32 accumulators, and never materializes the quadratic attention matrix.
 """
 
@@ -17,6 +18,7 @@ def _strided_attention(
     Q,
     K,
     V,
+    Indices,
     O,
     nq,
     nk,
@@ -33,6 +35,7 @@ def _strided_attention(
     so0: tl.constexpr,
     so1: tl.constexpr,
     so2: tl.constexpr,
+    INDEXED: tl.constexpr,
     QUERY_STRIDE: tl.constexpr,
     GQA: tl.constexpr,
     D: tl.constexpr,
@@ -62,8 +65,9 @@ def _strided_attention(
     )
     for start in range(0, key_limit, BN):
         keys = start + ki
+        rows = tl.load(Indices + keys, keys < nk, other=0) if INDEXED else keys
         k = tl.load(
-            K + keys[None, :] * sk0 + kv_head * sk1 + di[:, None] * sk2,
+            K + rows[None, :] * sk0 + kv_head * sk1 + di[:, None] * sk2,
             mask=(keys[None, :] < nk) & (di[:, None] < D),
             other=0,
         )
@@ -77,7 +81,7 @@ def _strided_attention(
         alpha = tl.exp2(maximum - new_maximum)
         weights = tl.exp2(scores - new_maximum[:, None])
         v = tl.load(
-            V + keys[:, None] * sv0 + kv_head * sv1 + di[None, :] * sv2,
+            V + rows[:, None] * sv0 + kv_head * sv1 + di[None, :] * sv2,
             mask=(keys[:, None] < nk) & (di[None, :] < D),
             other=0,
         )
@@ -92,8 +96,14 @@ def _strided_attention(
     )
 
 
-def strided_causal_attention(q, k, v, *, first_query: int, query_stride: int):
-    """Return [queries, heads, dim] attention; k/v are [keys, KV heads, dim]."""
+def strided_causal_attention(
+    q, k, v, *, first_query: int, query_stride: int, kv_indices=None
+):
+    """Return [queries, heads, dim]; optional indices map logical to physical KV.
+
+    Indices must reference valid initialized rows. Ownership validation provides
+    that invariant without a device-to-host bounds check in the attention path.
+    """
     if q.ndim != 3 or k.ndim != 3 or v.shape != k.shape:
         raise ValueError("Expected rank-three Q and matching K/V")
     if q.device.type != "cuda" or k.device != q.device or v.device != q.device:
@@ -120,7 +130,15 @@ def strided_causal_attention(q, k, v, *, first_query: int, query_stride: int):
         or query_stride < 1
     ):
         raise ValueError("Invalid absolute query positions")
-    if nq and first_query + (nq - 1) * query_stride >= len(k):
+    nk = len(k) if kv_indices is None else len(kv_indices)
+    if kv_indices is not None and (
+        kv_indices.device != q.device
+        or kv_indices.dtype not in (torch.int32, torch.int64)
+        or kv_indices.ndim != 1
+        or not kv_indices.is_contiguous()
+    ):
+        raise ValueError("KV indices must be a contiguous device integer vector")
+    if nq and first_query + (nq - 1) * query_stride >= nk:
         raise ValueError("Query position exceeds the KV prefix")
     output = torch.empty_like(q)
     if nq:
@@ -128,14 +146,16 @@ def strided_causal_attention(q, k, v, *, first_query: int, query_stride: int):
             q,
             k,
             v,
+            kv_indices if kv_indices is not None else k,
             output,
             nq,
-            len(k),
+            nk,
             first_query,
             *q.stride(),
             *k.stride(),
             *v.stride(),
             *output.stride(),
+            kv_indices is not None,
             query_stride,
             heads // k.shape[1],
             dim,
@@ -154,6 +174,7 @@ def _ring_update(
     Q,
     K,
     V,
+    Indices,
     M,
     Z,
     A,
@@ -173,6 +194,7 @@ def _ring_update(
     so0: tl.constexpr,
     so1: tl.constexpr,
     so2: tl.constexpr,
+    INDEXED: tl.constexpr,
     QUERY_STRIDE: tl.constexpr,
     KEY_STRIDE: tl.constexpr,
     GQA: tl.constexpr,
@@ -205,8 +227,9 @@ def _ring_update(
     key_limit = nk
     for start in range(0, key_limit, BN):
         keys = start + ki
+        rows = tl.load(Indices + keys, keys < nk, other=0) if INDEXED else keys
         k = tl.load(
-            K + keys[None, :] * sk0 + kv_head * sk1 + di[:, None] * sk2,
+            K + rows[None, :] * sk0 + kv_head * sk1 + di[:, None] * sk2,
             mask=(keys[None, :] < nk) & (di[:, None] < D),
             other=0,
         )
@@ -222,7 +245,7 @@ def _ring_update(
         alpha = tl.exp2(maximum - safe_maximum)
         weights = tl.exp2(scores - safe_maximum[:, None])
         v = tl.load(
-            V + keys[:, None] * sv0 + kv_head * sv1 + di[None, :] * sv2,
+            V + rows[:, None] * sv0 + kv_head * sv1 + di[None, :] * sv2,
             mask=(keys[:, None] < nk) & (di[None, :] < D),
             other=0,
         )
@@ -256,25 +279,35 @@ class RingAccumulator:
         )
         self.numerator = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
 
-    def add(self, k, v, first_key):
-        if not len(self.q) or not len(k):
+    def add(self, k, v, first_key, *, kv_indices=None):
+        nk = len(k) if kv_indices is None else len(kv_indices)
+        if kv_indices is not None and (
+            kv_indices.device != self.q.device
+            or kv_indices.dtype not in (torch.int32, torch.int64)
+            or kv_indices.ndim != 1
+            or not kv_indices.is_contiguous()
+        ):
+            raise ValueError("KV indices must be a contiguous device integer vector")
+        if not len(self.q) or not nk:
             return
         nq, heads, dim = self.q.shape
         _ring_update[(triton.cdiv(nq, 32), heads)](
             self.q,
             k,
             v,
+            kv_indices if kv_indices is not None else k,
             self.maximum,
             self.denominator,
             self.numerator,
             nq,
-            len(k),
+            nk,
             self.first_query,
             first_key,
             *self.q.stride(),
             *k.stride(),
             *v.stride(),
             *self.numerator.stride(),
+            kv_indices is not None,
             self.stride,
             self.stride,
             heads // k.shape[1],

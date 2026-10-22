@@ -57,13 +57,23 @@ class GroupWorker:
         self, model, options, *, store, verify=False, atol=1e-4, rtol=1e-4, timeout=600
     ):
         self.model = model
-        self.options = options
+        self.options = dict(options)
+        execution_tokens = self.options.pop("memory_execution_tokens", 32768)
         self.verify, self.atol, self.rtol = verify, atol, rtol
         self.timeout = timeout
         self.store = store
         self.rank = dist.get_rank()
         self.states = {}
         self.groups = {}
+        from sglang.srt.dynamic_sp.kv_storage import NativeKVStorage
+
+        self.kv_pool = NativeKVStorage(
+            model,
+            options["max_local_tokens"],
+            dist.get_world_size(),
+            options.get("attention_backend", "gathered"),
+            execution_tokens=execution_tokens,
+        )
 
     def engine(self, operation):
         members = operation.members
@@ -75,6 +85,7 @@ class GroupWorker:
                 self.model,
                 control_group=None,
                 communication=communication,
+                kv_pool=self.kv_pool,
                 **self.options,
             )
             self.groups[members] = (operation.ticket, communication, engine)
@@ -83,6 +94,11 @@ class GroupWorker:
     @torch.inference_mode()
     def execute(self, operation):
         started = time.perf_counter()
+        memory_before = (
+            torch.cuda.memory_stats(self.model.device)
+            if self.model.device.type == "cuda"
+            else {}
+        )
         engine = self.engine(operation)
         members = operation.members
         local = {rank: index for index, rank in enumerate(members)}
@@ -124,8 +140,34 @@ class GroupWorker:
             operation.plan.admit,
             operation.plan.release,
         )
+        self.kv_pool.begin()
         try:
             outputs = engine.execute(plan if engine.rank == 0 else None)
+
+            def check_allocator():
+                stats = (
+                    torch.cuda.memory_stats(self.model.device)
+                    if self.model.device.type == "cuda"
+                    else {}
+                )
+                retries = stats.get("num_alloc_retries", 0) - memory_before.get(
+                    "num_alloc_retries", 0
+                )
+                ooms = stats.get("num_ooms", 0) - memory_before.get("num_ooms", 0)
+                engine.metrics.update(
+                    allocator_retries=retries,
+                    allocator_ooms=ooms,
+                    allocated_bytes=stats.get("allocated_bytes.all.current", 0),
+                    reserved_bytes=stats.get("reserved_bytes.all.current", 0),
+                    native_kv_pool_bytes=self.kv_pool.reserved_bytes,
+                    execution_reserve_bytes=self.kv_pool.execution_reserve_bytes,
+                    peak_allocated_bytes=stats.get("allocated_bytes.all.peak", 0),
+                    peak_reserved_bytes=stats.get("reserved_bytes.all.peak", 0),
+                )
+                if retries or ooms:
+                    raise RuntimeError(
+                        f"Allocator retry invalidates this run: retries={retries}, OOMs={ooms}"
+                    )
 
             def check_and_stage():
                 errors = {}
@@ -166,7 +208,12 @@ class GroupWorker:
                 "verify, sample and stage publication", check_and_stage
             )
             engine._agree(operation.ticket, "Operation tickets differ at commit")
+
+            self.kv_pool.commit(self.states, staged)
             self.states = staged
+            # Include native allocator free-list updates in the check. A retry
+            # is fatal to the trial, so no extra group vote is needed here.
+            check_allocator()
             ready = time.perf_counter()
             return {
                 "ticket": operation.ticket,
@@ -180,6 +227,10 @@ class GroupWorker:
                 "errors": errors,
             }
         finally:
+            if self.kv_pool.allocated is not None and not engine._failed:
+                if self.model.device.type == "cuda":
+                    torch.cuda.current_stream(self.model.device).synchronize()
+                self.kv_pool.rollback()
             # Cached engines retain communicators, not stale staged/committed KV.
             engine._states = {}
 
@@ -198,6 +249,13 @@ class GroupWorker:
                 connection.send({"status": "stopped"})
                 connection.close()
                 return
+            elif message[0] == "reset":
+                if self.states:
+                    raise RuntimeError("Request state leaked across benchmark phases")
+                self.kv_pool.assert_empty()
+                if self.model.device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(self.model.device)
+                connection.send({"status": "empty"})
             elif message[0] == "execute":
                 operation = message[1]
                 try:
@@ -345,6 +403,7 @@ class AsyncExecutor:
         self.busy = set()
         self.thread = None
         self.thread_error = None
+        self.worker_failure = None
         if self.rank == 0:
             authkey = os.urandom(32)
             # Clock-domain validation above requires a single host. Use IPv4
@@ -413,13 +472,16 @@ class AsyncExecutor:
             self.connections[rank].send(("execute", operation))
 
     def poll(self, timeout=0.0):
+        if self.worker_failure is not None:
+            raise RuntimeError(self.worker_failure)
         if self.thread_error:
             raise RuntimeError("Local async worker failed") from self.thread_error
         events = []
         for connection in wait(list(self.connections.values()), timeout):
             message = connection.recv()
             if message["status"] == "fatal":
-                raise RuntimeError(f"Async worker failed: {message}")
+                self.worker_failure = f"Async worker failed: {message}"
+                raise RuntimeError(self.worker_failure)
             operation, _start, responses = self.inflight[message["ticket"]]
             rank = message["rank"]
             if (
@@ -442,6 +504,18 @@ class AsyncExecutor:
         if any(now - start > self.timeout for _, start, _ in self.inflight.values()):
             raise TimeoutError("Async operation exceeded its completion timeout")
         return events
+
+    def reset(self):
+        if self.inflight:
+            raise RuntimeError("Cannot reset while operations are in flight")
+        for connection in self.connections.values():
+            connection.send(("reset",))
+        for connection in self.connections.values():
+            if (
+                not connection.poll(self.timeout)
+                or connection.recv()["status"] != "empty"
+            ):
+                raise RuntimeError("Worker KV reset validation failed")
 
     def close(self):
         if self.inflight:

@@ -338,9 +338,7 @@ class TetrisScheduler:
         decisions = []
         # FIFO arrivals receive complete, persistent chunk reservations. Neither
         # resident priority nor per-dispatch token budgets change the paper plan.
-        for request in sorted(
-            state.requests, key=lambda r: r.submitted_at
-        ):
+        for request in sorted(state.requests, key=lambda r: r.submitted_at):
             rid = request.prompt.request_id
             if request.complete or rid in self.calendar.requests:
                 continue
@@ -385,7 +383,10 @@ class TetrisScheduler:
         # Insufficient memory must fail the experiment rather than substitute
         # different degrees, chunks, or request priorities under Tetris's name.
         placements = {
-            r.prompt.request_id: (r.ranks, r.end)
+            r.prompt.request_id: (
+                r.ranks,
+                r.end if r.reserved_end is None else r.reserved_end,
+            )
             for r in state.requests
             if r.ranks and r.prompt.request_id not in release
         }

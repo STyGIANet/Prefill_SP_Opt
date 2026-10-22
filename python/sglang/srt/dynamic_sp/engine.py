@@ -24,6 +24,11 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from sglang.srt.dynamic_sp.attention import AttentionAccumulator
+from sglang.srt.dynamic_sp.kv_storage import (
+    SlotKV,
+    read_layer,
+    write_layer,
+)
 from sglang.srt.dynamic_sp.plan import (
     PrefillPlan,
     Prompt,
@@ -57,7 +62,7 @@ class _State:
     prompt: Prompt
     ranks: tuple[int, ...]
     end: int
-    kv: torch.Tensor  # [local_tokens, layers, 2, kv_heads, head_dim]
+    kv: torch.Tensor | SlotKV  # [local_tokens, layers, 2, kv_heads, head_dim]
 
 
 @dataclass
@@ -92,10 +97,12 @@ class DynamicSPPrefillEngine:
         kv_transport: str = "targeted",
         shared_attention: str = "auto",
         migration_overlap: bool = True,
+        kv_pool=None,
     ):
         if not dist.is_initialized():
             raise RuntimeError("Initialize torch.distributed before the SP engine")
         self.communication = communication
+        self._local_checks_only = False
         self.data_group = data_group
         self.control_group = control_group
         if communication is not None:
@@ -115,6 +122,7 @@ class DynamicSPPrefillEngine:
             if tuple(dist.get_process_group_ranks(control_group)) != self.global_ranks:
                 raise ValueError("Control and data group rank orders differ")
         self.model = model
+        self.kv_pool = kv_pool
         self.max_local_tokens = max_local_tokens
         self.kv_block_size = kv_block_size
         self.query_block_size = query_block_size
@@ -211,6 +219,22 @@ class DynamicSPPrefillEngine:
     def _checked(self, label, fn):
         started = time.perf_counter()
         self.metrics["checked_phases"] = self.metrics.get("checked_phases", 0) + 1
+        if self._local_checks_only:
+            # Async workers report fatal errors through their coordinator socket.
+            # Never enter a recovery collective after peers may have advanced.
+            try:
+                return fn()
+            except BaseException as exc:
+                self._failed = True
+                raise RuntimeError(f"Fatal prefill phase {label} on rank {self.rank}") from exc
+            finally:
+                self.metrics["local_work_and_device_wait_seconds"] = (
+                    self.metrics.get("local_work_and_device_wait_seconds", 0.0)
+                    + time.perf_counter() - started
+                )
+                self.metrics["local_checked_phases"] = (
+                    self.metrics.get("local_checked_phases", 0) + 1
+                )
         result, error, fatal = None, None, False
         try:
             result = fn()
@@ -341,6 +365,32 @@ class DynamicSPPrefillEngine:
 
     @torch.inference_mode()
     def execute(self, plan: PrefillPlan | None = None) -> dict[str, torch.Tensor]:
+        # Async workers retain ownership through their outer verification and
+        # publication. Standalone engines own the same slot transaction here.
+        owned = self.kv_pool is not None and self.kv_pool.allocated is None
+        old = self._states
+        if owned:
+            self.kv_pool.begin()
+        try:
+            memory_before = (
+                torch.cuda.memory_stats(self.model.device)
+                if owned and self.model.device.type == "cuda"
+                else None
+            )
+            outputs = self._execute(plan, memory_before=memory_before)
+            if owned:
+                self.kv_pool.commit(old, self._states)
+            return outputs
+        except BaseException:
+            if owned and not self._failed:
+                self._complete_device_work()
+                self.kv_pool.rollback()
+                self._states = old
+            raise
+
+    def _execute(
+        self, plan: PrefillPlan | None = None, *, memory_before=None
+    ) -> dict[str, torch.Tensor]:
         """Execute worker zero's plan; return last-prefix logits on every worker.
 
         Omitted requests remain resident and paused. A step with end equal to
@@ -392,7 +442,7 @@ class DynamicSPPrefillEngine:
                     dist.all_reduce(token, group=self.data_group)
                 self._checked("ring transport initialization", lambda: None)
                 self._ring_initialized = True
-            deferred = (
+            deferred = self.kv_pool is not None or (
                 self.attention_backend in ("ring", "gathered")
                 and self.migration_overlap
             )
@@ -403,17 +453,45 @@ class DynamicSPPrefillEngine:
                 if step.end > start:
                     forwards.append((state, start))
                 staged[step.request_id] = state
-            outputs = self._prefill_batch(forwards) if forwards else {}
+            if self._migration is not None and (
+                not self.migration_overlap or self.attention_backend == "streaming"
+            ):
+                self._migration.wait(0)
+                for layer in range(1, self.model.num_layers):
+                    self._migration.launch(layer)
+                    self._migration.wait(layer)
+                self._migration.drain()
+                self._migration = None
+            # Preserve validation/allocation and completion consensus, but do not
+            # synchronize hosts at each projection, attention and MLP phase.
+            self._local_checks_only = self.communication is not None
+            try:
+                outputs = self._prefill_batch(forwards) if forwards else {}
+            finally:
+                self._local_checks_only = False
             if not forwards and self._migration is not None:
                 self._migration.wait(0)
                 for layer in range(1, self.model.num_layers):
                     self._migration.launch(layer)
                     self._migration.wait(layer)
                 self._checked("migration-only completion", self._migration.drain)
+
             # One completion boundary per transaction, after communication
             # streams have joined the compute stream through their ready events.
             # Do not synchronize the entire device: independent work may overlap.
-            self._checked("device completion", self._complete_device_work)
+            def complete():
+                self._complete_device_work()
+                if memory_before is not None:
+                    stats = torch.cuda.memory_stats(self.model.device)
+                    if any(
+                        stats.get(key, 0) != memory_before.get(key, 0)
+                        for key in ("num_alloc_retries", "num_ooms")
+                    ):
+                        raise RuntimeError(
+                            "Allocator retry/OOM invalidates this operation"
+                        )
+
+            self._checked("device completion", complete)
             self._agree(self.version, "Worker versions diverged before commit")
             self._states = staged
             self.version += 1
@@ -427,10 +505,14 @@ class DynamicSPPrefillEngine:
             try:
                 # Never free or reuse staging buffers with device work in flight,
                 # including recoverable failures in model callbacks.
-                if self._migration is not None:
-                    self._migration.drain()
-                if self._ring is not None:
-                    self._ring.drain()
+                # A failed async peer may never issue the matching collective.
+                # Retain buffers and let process teardown reclaim them; draining
+                # here could hide the fatal notification behind a NCCL timeout.
+                if not self._failed:
+                    if self._migration is not None:
+                        self._migration.drain()
+                    if self._ring is not None:
+                        self._ring.drain()
             except BaseException:
                 self._failed = True
                 raise
@@ -448,14 +530,27 @@ class DynamicSPPrefillEngine:
             tail = (m.num_layers, 2, m.num_kv_heads, m.head_dim)
             for step in steps:
                 shape = (len(local_positions(step.end, step.ranks, self.rank)), *tail)
-                kv = torch.empty(shape, device=m.device, dtype=m.dtype)
+                previous = self._states.get(step.request_id)
+                reusable = (
+                    previous.kv
+                    if previous is not None
+                    and previous.ranks == step.ranks
+                    and isinstance(previous.kv, SlotKV)
+                    else None
+                )
+                kv = (
+                    self.kv_pool.allocate(shape[0], reusable)
+                    if self.kv_pool is not None
+                    else torch.empty(shape, device=m.device, dtype=m.dtype)
+                )
                 state = _State(prompts[step.request_id], step.ranks, step.end, kv)
                 states.append(state)
                 previous = self._states.get(step.request_id)
                 if previous is None or previous.end == 0:
                     continue
                 if previous.ranks == step.ranks:
-                    kv[: len(previous.kv)].copy_(previous.kv)
+                    if not isinstance(kv, SlotKV):
+                        kv[: len(previous.kv)].copy_(previous.kv)
                 else:
                     changes.append((state, previous))
             if not changes:
@@ -489,11 +584,19 @@ class DynamicSPPrefillEngine:
             send_counts = [sum(map(len, parts)) for parts in sends]
             recv_counts = [sum(map(len, parts)) for parts in receives]
             transfer_tail = tail[1:] if deferred else tail
-            send = torch.empty(
-                (sum(send_counts), *transfer_tail), device=m.device, dtype=m.dtype
+            send = (
+                self.kv_pool.buffer("migration_send", sum(send_counts))
+                if self.kv_pool is not None
+                else torch.empty(
+                    (sum(send_counts), *transfer_tail), device=m.device, dtype=m.dtype
+                )
             )
-            recv = torch.empty(
-                (sum(recv_counts), *transfer_tail), device=m.device, dtype=m.dtype
+            recv = (
+                self.kv_pool.buffer("migration_recv", sum(recv_counts))
+                if self.kv_pool is not None
+                else torch.empty(
+                    (sum(recv_counts), *transfer_tail), device=m.device, dtype=m.dtype
+                )
             )
             offset, pack = 0, []
             for parts in sends:
@@ -615,9 +718,11 @@ class DynamicSPPrefillEngine:
                             layer=layer,
                         ):
                             if self.rank == owner:
-                                block = state.kv[
-                                    offset : offset + len(block_positions), layer
-                                ].contiguous()
+                                block = read_layer(
+                                    state.kv,
+                                    layer,
+                                    slice(offset, offset + len(block_positions)),
+                                ).contiguous()
                             else:
                                 block = torch.empty(
                                     (
@@ -753,11 +858,10 @@ class DynamicSPPrefillEngine:
             if any(t.dtype != m.dtype or t.device != m.device for t in (q, k, v)):
                 raise ValueError("Model projections changed dtype or device")
             for state, prefix_count, begin, end in layouts:
-                state.kv[prefix_count:, layer, 0].copy_(k[begin:end])
-                state.kv[prefix_count:, layer, 1].copy_(v[begin:end])
+                write_layer(state.kv, layer, prefix_count, k[begin:end], v[begin:end])
         if workspace is not None:
             for state, begin, end in workspace.packs:
-                workspace.send[begin:end].copy_(state.kv[:, layer])
+                read_layer(state.kv, layer, out=workspace.send[begin:end])
         return q
 
     def _prefill_gathered(self, x, positions, layouts, workspace):
@@ -929,8 +1033,17 @@ class DynamicSPPrefillEngine:
                         )
                     cursor += count
         shape = (2, m.num_kv_heads, m.head_dim)
-        send = torch.zeros((send_rows, *shape), device=m.device, dtype=m.dtype)
-        received = torch.empty((receive_rows, *shape), device=m.device, dtype=m.dtype)
+        send = (
+            self.kv_pool.buffer("gather_send", send_rows)
+            if self.kv_pool is not None
+            else torch.empty((send_rows, *shape), device=m.device, dtype=m.dtype)
+        )
+        send.zero_()
+        received = (
+            self.kv_pool.buffer("gather_recv", receive_rows)
+            if self.kv_pool is not None
+            else torch.empty((receive_rows, *shape), device=m.device, dtype=m.dtype)
+        )
         for i, (state, _, begin, end) in enumerate(layouts):
             mapping = (
                 [
@@ -988,14 +1101,8 @@ class DynamicSPPrefillEngine:
             if begin == end:
                 continue
             private = len(state.ranks) == 1
-            kv = (
-                state.kv[:, layer]
-                if private
-                else received.index_select(0, indices[request])
-            )
             if (
-                not private
-                and self.shared_attention == "auto"
+                self.shared_attention == "auto"
                 and q.device.type == "cuda"
                 and q.dtype in (torch.float16, torch.bfloat16)
                 and m.head_dim <= 256
@@ -1004,18 +1111,39 @@ class DynamicSPPrefillEngine:
                     strided_causal_attention,
                 )
 
+                if private and isinstance(state.kv, SlotKV):
+                    k = state.kv.pool.native.get_key_buffer(layer)
+                    v = state.kv.pool.native.get_value_buffer(layer)
+                    mapping = state.kv.indices
+                elif private:
+                    k, v = state.kv[:, layer, 0], state.kv[:, layer, 1]
+                    mapping = None
+                else:
+                    # Read owner-ordered receive buffers through the logical
+                    # position map, without materializing a reordered KV copy.
+                    k, v = received[:, 0], received[:, 1]
+                    mapping = indices[request]
                 output[begin:end].copy_(
                     strided_causal_attention(
                         q[begin:end],
-                        kv[:, 0],
-                        kv[:, 1],
+                        k,
+                        v,
                         first_query=prefix_count * len(state.ranks)
                         + state.ranks.index(self.rank),
                         query_stride=len(state.ranks),
+                        kv_indices=mapping,
                     )
                 )
                 self.metrics["fused_attention_calls"] += 1
+                self.metrics["indexed_attention_calls"] = self.metrics.get(
+                    "indexed_attention_calls", 0
+                ) + int(mapping is not None)
                 continue
+            kv = (
+                read_layer(state.kv, layer)
+                if private
+                else received.index_select(0, indices[request])
+            )
             k = kv[:, 0].transpose(0, 1).unsqueeze(0)
             v = kv[:, 1].transpose(0, 1).unsqueeze(0)
             for offset in range(begin, end, self.query_block_size):

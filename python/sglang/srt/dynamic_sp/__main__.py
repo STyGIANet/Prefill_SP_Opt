@@ -19,6 +19,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from sglang.srt.dynamic_sp.arrivals import ArrivalSource
 from sglang.srt.dynamic_sp.engine import DynamicSPPrefillEngine
+from sglang.srt.dynamic_sp.kv_storage import NativeKVStorage
 from sglang.srt.dynamic_sp.llama import load_native_llama
 from sglang.srt.dynamic_sp.metrics import throughput_summary
 from sglang.srt.dynamic_sp.plan import PrefillPlan, Prompt, PromptStep
@@ -113,6 +114,21 @@ def main():
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--execution-mode", choices=("async", "sync"), default="async")
     parser.add_argument("--async-timeout", type=float, default=600)
+    parser.add_argument("--warmup-requests", type=int, default=0)
+    parser.add_argument("--warmup-tokens", type=int, default=8192)
+    parser.add_argument(
+        "--progress-interval",
+        type=float,
+        default=10.0,
+        help="Async progress refresh seconds; 0 disables progress",
+    )
+    parser.add_argument(
+        "--progress-throughput-target",
+        type=float,
+        default=0.0,
+        help="Throughput bar reference in input tokens/sec; 0 uses observed peak",
+    )
+    parser.add_argument("--allow-profile-backend-mismatch", action="store_true")
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument(
         "--dtype", choices=("float32", "float16", "bfloat16"), default="float32"
@@ -158,6 +174,21 @@ def main():
         "--output", help="Save JSON validation/timing results on worker zero"
     )
     args = parser.parse_args()
+    if any(
+        not math.isfinite(v) or v < 0
+        for v in (args.progress_interval, args.progress_throughput_target)
+    ):
+        parser.error(
+            "Progress interval and throughput target must be finite and nonnegative"
+        )
+    if args.warmup_tokens <= 0:
+        parser.error("warmup-tokens must be positive")
+    if args.warmup_requests < 0:
+        parser.error("warmup-requests must be nonnegative")
+    if args.warmup_requests and (args.execution_mode != "async" or args.schedule):
+        parser.error(
+            "Warmup requires async online execution; use --warmup-requests 0 otherwise"
+        )
     if args.chunk_size <= 0 or args.prompt_length <= 0:
         parser.error("prompt-length and chunk-size must be positive")
     if any(not math.isfinite(t) or t < 0 for t in (args.atol, args.rtol)):
@@ -180,9 +211,21 @@ def main():
         model = load_native_llama(
             args.model_path, dtype=args.dtype, device=args.device, local_rank=local_rank
         )
+        kv_pool = (
+            NativeKVStorage(
+                model,
+                args.max_local_tokens,
+                dist.get_world_size(),
+                args.attention_backend,
+                execution_tokens=args.max_local_tokens,
+            )
+            if args.execution_mode == "sync"
+            else None
+        )
         engine = DynamicSPPrefillEngine(
             model,
             control_group=control,
+            kv_pool=kv_pool,
             max_local_tokens=args.max_local_tokens,
             kv_block_size=args.kv_block_size,
             query_block_size=args.query_block_size,
@@ -239,6 +282,11 @@ def main():
                     ("shared_attention", args.shared_attention),
                     ("migration_overlap", args.migration_overlap),
                 ):
+                    if args.allow_profile_backend_mismatch and key in (
+                        "attention_backend",
+                        "kv_transport",
+                    ):
+                        continue
                     if metadata.get(key) != value:
                         raise ValueError(
                             f"Tetris profile {key}={metadata.get(key)!r} does not match {value!r}"

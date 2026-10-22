@@ -19,6 +19,7 @@ import torch
 import torch.distributed as dist
 from sglang.srt.dynamic_sp.communication import GroupCommunication, rendezvous_store
 from sglang.srt.dynamic_sp.engine import DynamicSPPrefillEngine
+from sglang.srt.dynamic_sp.kv_storage import NativeKVStorage
 from sglang.srt.dynamic_sp.llama import load_native_llama
 from sglang.srt.dynamic_sp.plan import PrefillPlan, Prompt, PromptStep
 
@@ -70,9 +71,17 @@ def main():
         model = load_native_llama(
             args.model_path, dtype=args.dtype, local_rank=local_rank
         )
+        kv_pool = NativeKVStorage(
+            model,
+            args.max_local_tokens,
+            world,
+            args.attention_backend,
+            execution_tokens=max(*args.lengths, *args.histories),
+        )
         engine = DynamicSPPrefillEngine(
             model,
             control_group=control,
+            kv_pool=kv_pool,
             max_local_tokens=args.max_local_tokens,
             attention_backend=args.attention_backend,
             kv_transport=args.kv_transport,
@@ -116,6 +125,7 @@ def main():
                             model,
                             control_group=None,
                             communication=communication,
+                            kv_pool=kv_pool,
                             max_local_tokens=args.max_local_tokens,
                             attention_backend=args.attention_backend,
                             kv_transport=args.kv_transport,
@@ -200,6 +210,7 @@ def main():
                                         unique_hosts.index(host) for host in hosts
                                     ],
                                     "metadata": {
+                                        "kv_storage": "native_sglang_slot_pool",
                                         "model_path": os.path.realpath(args.model_path),
                                         "dtype": args.dtype,
                                         "gpu_names": names,

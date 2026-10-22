@@ -86,7 +86,11 @@ and the reservation calendar without depending on the Tetris planner.
 
 The paper uses NVSHMEM-based ring communication and a C++ planner. This backend
 uses NCCL P2P and a Python planner, with explicit transactional error checks.
-Intermediate checks vote on synchronous host errors without waiting for CUDA.
+Async prefill phases check host errors locally without per-layer status votes.
+A failure during these phases invalidates the run and requires worker restart;
+it does not attempt collective recovery after peers may have advanced.
+Validation, allocation, and publication retain operation-boundary consensus.
+The synchronous reference path retains intermediate status votes.
 Migration explicitly orders packing before transfer with a stream dependency.
 A compute-stream completion wait before commit detects asynchronous execution
 errors and preserves completion timestamps. 
@@ -122,8 +126,10 @@ in its algorithm. Existing reservations retain the threshold used at admission.
 Short runs may end before the first periodic update. Use a sufficiently long
 trace when evaluating load adaptation. Evaluation defaults to all eligible
 records in the selected split; `--num-prompts N` explicitly limits a run.
-The input-token cap and length-mode filtering still apply. Threshold fitting
-has its own independent record limit.
+Full records are retained by default; records exceeding the model context are
+excluded with explicit provenance. Threshold fitting has its own independent
+record limit. The benchmark matrix freezes one profile across all datasets and
+execution backends; calibration backend differences are recorded in its CSV.
 
 ## Independent fitting and evaluation
 
@@ -170,21 +176,3 @@ Artifacts are saved under the run's `tetris/` directory, including the fitting
 workload, measurement samples, fit diagnostics, frozen profile, and stage logs.
 Reference verification changes execution time. Use `--no-verify` for performance
 experiments and validate correctness separately.
-
-## Validation
-
-CPU distributed tests cover KV and logit equality, arbitrary placement changes,
-empty shards, migration-only operations, and rollback during model and attention
-failures. Single-GPU tests compare the fused ring accumulation with independent
-FP32 attention for FP16 and BF16, including reversed shard traversal.
-
-The multi-GPU test checks NCCL ring execution, delayed layer migration, and
-failure while migration is active. It is a correctness test, not a benchmark:
-
-```bash
-DYNAMIC_SP_TEST_GPUS=8 PYTHONPATH=python python -m pytest -q \
-  python/sglang/srt/dynamic_sp/tests/test_ring_cuda.py
-```
-
-On a host with fewer than two visible GPUs this test is skipped. Passing CPU and
-single-GPU tests alone does not validate NCCL stream interaction on eight GPUs.

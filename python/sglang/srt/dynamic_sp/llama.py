@@ -41,7 +41,7 @@ class SGLangLlamaPrefillModel:
         layer = self.model.model.layers[layer]
         # Bypass stage-boundary residual plumbing: ownership is per prompt,
         # and residual rows remain colocated with their token across layers.
-        normalized = layer.input_layernorm.forward_native(x)
+        normalized = layer.input_layernorm(x)
         q, k, v = layer.self_attn.forward_prepare_native(positions, normalized)
         return (
             q.reshape(-1, self.num_heads, self.head_dim),
@@ -52,12 +52,11 @@ class SGLangLlamaPrefillModel:
     def complete(self, layer, residual, attention):
         layer = self.model.model.layers[layer]
         projected, _ = layer.self_attn.o_proj(attention.flatten(1))
-        residual = residual + projected
-        normalized = layer.post_attention_layernorm.forward_native(residual)
+        normalized, residual = layer.post_attention_layernorm(projected, residual)
         return residual + layer.mlp(normalized)
 
     def logits(self, x):
-        x = self.model.model.norm.forward_native(x)
+        x = self.model.model.norm(x)
         # The vocabulary can be padded in native SGLang embedding/LM heads.
         return F.linear(x, self.model.lm_head.weight[: self.vocab_size])
 

@@ -13,6 +13,7 @@ from contextlib import nullcontext
 import torch
 import torch.distributed as dist
 from sglang.srt.dynamic_sp.attention import AttentionAccumulator
+from sglang.srt.dynamic_sp.kv_storage import SlotKV, read_layer, scatter_layer
 from sglang.srt.dynamic_sp.plan import local_positions
 
 
@@ -28,9 +29,13 @@ class LayerMigration:
             self.pack,
         ) = transfer
         self.stream = (
-            torch.cuda.Stream(device=engine.model.device)
-            if engine.model.device.type == "cuda"
-            else None
+            engine.kv_pool.migration_stream
+            if engine.kv_pool is not None
+            else (
+                torch.cuda.Stream(device=engine.model.device)
+                if engine.model.device.type == "cuda"
+                else None
+            )
         )
         self.ready = torch.cuda.Event() if self.stream is not None else None
         self.layer = -1
@@ -41,9 +46,7 @@ class LayerMigration:
 
         def pack():
             for source, index, offset, count in self.pack:
-                torch.index_select(
-                    source[:, layer], 0, index, out=self.send[offset : offset + count]
-                )
+                read_layer(source, layer, index, out=self.send[offset : offset + count])
 
         # Vote on host-side packing failures before entering the collective.
         # Packing is asynchronous: transfer must wait for its producer stream.
@@ -58,9 +61,7 @@ class LayerMigration:
                 self.recv, self.send, self.recv_counts, self.send_counts
             )
             for target, index, offset, count in self.unpack:
-                target[:, layer].index_copy_(
-                    0, index, self.recv[offset : offset + count]
-                )
+                scatter_layer(target, layer, index, self.recv[offset : offset + count])
             if self.ready is not None:
                 self.ready.record(self.stream)
         self.layer = layer
@@ -110,10 +111,15 @@ class RingWorkspace:
         self.engine = engine
         m = engine.model
         self.stream = (
-            torch.cuda.Stream(device=m.device) if m.device.type == "cuda" else None
+            engine.kv_pool.attention_stream
+            if engine.kv_pool is not None
+            else (
+                torch.cuda.Stream(device=m.device) if m.device.type == "cuda" else None
+            )
         )
         self.ready = torch.cuda.Event() if self.stream is not None else None
         self.buffers, self.positions = [], []
+        cursor = 0
         for state, _, _, _ in layouts:
             rows = (state.end + len(state.ranks) - 1) // len(state.ranks)
             # Nonmembers take part in error votes, not in the ring itself.
@@ -123,9 +129,22 @@ class RingWorkspace:
                 m.num_kv_heads,
                 m.head_dim,
             )
-            self.buffers.append(
-                [torch.empty(shape, device=m.device, dtype=m.dtype) for _ in range(2)]
-            )
+            if engine.kv_pool is not None:
+                count = shape[0]
+                self.buffers.append(
+                    [
+                        engine.kv_pool.buffer(f"ring_{i}", cursor + count)[cursor:]
+                        for i in range(2)
+                    ]
+                )
+                cursor += count
+            else:
+                self.buffers.append(
+                    [
+                        torch.empty(shape, device=m.device, dtype=m.dtype)
+                        for _ in range(2)
+                    ]
+                )
             self.positions.append(
                 [
                     torch.tensor(
@@ -150,10 +169,23 @@ class RingWorkspace:
             and m.head_dim <= 256
             and self.engine.shared_attention == "auto"
         )
+        self.layer = layer
+        self.direct_local = [
+            fused and isinstance(state.kv, SlotKV) for state, _, _, _ in layouts
+        ]
         for i, (state, prefix, begin, end) in enumerate(layouts):
-            if self.engine.rank in state.ranks:
-                self.buffers[i][0].zero_()
-                self.buffers[i][0][: len(state.kv)].copy_(state.kv[:, layer])
+            if self.engine.rank in state.ranks and (
+                not self.direct_local[i] or len(state.ranks) > 1
+            ):
+                # Local attention reads the pool independently. Packing is only
+                # for transport, and can run concurrently on the communication
+                # stream once the projected KV writes are ready.
+                stream = self.stream if self.direct_local[i] else None
+                if stream is not None:
+                    stream.wait_stream(torch.cuda.current_stream(m.device))
+                with torch.cuda.stream(stream) if stream is not None else nullcontext():
+                    self.buffers[i][0].zero_()
+                    read_layer(state.kv, layer, out=self.buffers[i][0][: len(state.kv)])
             if fused:
                 from sglang.srt.dynamic_sp.fused_attention import RingAccumulator
 
@@ -230,9 +262,20 @@ class RingWorkspace:
                                         self.positions[i][origin][offset:stop],
                                     )
                         else:
-                            accumulators_for_request.add(
-                                current[:count, 0], current[:count, 1], origin
-                            )
+                            if hop == 0 and self.direct_local[i]:
+                                accumulators_for_request.add(
+                                    state.kv.pool.native.get_key_buffer(self.layer),
+                                    state.kv.pool.native.get_value_buffer(self.layer),
+                                    origin,
+                                    kv_indices=state.kv.indices,
+                                )
+                                e.metrics["indexed_attention_calls"] = (
+                                    e.metrics.get("indexed_attention_calls", 0) + 1
+                                )
+                            else:
+                                accumulators_for_request.add(
+                                    current[:count, 0], current[:count, 1], origin
+                                )
                             e.metrics["fused_attention_calls"] += 1
                 except Exception as exc:  # noqa: BLE001 - drain the ring before rejection
                     error = exc

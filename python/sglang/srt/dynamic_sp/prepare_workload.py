@@ -67,6 +67,14 @@ def make_schedule(prompts, chunk_tokens, world_size=8, seed=0):
     return plans
 
 
+def encode_record(tokenizer, text, limit):
+    options = {"add_special_tokens": False, "truncation": limit is not None}
+    if limit is not None:
+        options["max_length"] = limit
+    tokens = tokenizer.encode(text, **options)
+    return tokens
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="NousResearch/Meta-Llama-3.1-8B-Instruct")
@@ -81,11 +89,15 @@ def main():
         default="all",
         help="all (default) or a positive count of eligible records",
     )
-    parser.add_argument("--input-tokens", type=int, default=8192)
+    parser.add_argument(
+        "--input-tokens",
+        default="all",
+        help="all preserves complete records; an integer explicitly caps tokens",
+    )
     parser.add_argument(
         "--length-mode",
         choices=("fixed", "natural"),
-        default="fixed",
+        default="natural",
         help="fixed skips short records; natural preserves lengths up to input-tokens",
     )
     parser.add_argument("--chunk-tokens", type=int, default=1024)
@@ -116,11 +128,22 @@ def main():
             parser.error("num-prompts must be all or a positive integer")
         if args.num_prompts <= 0:
             parser.error("num-prompts must be all or a positive integer")
-    if min(args.input_tokens, args.chunk_tokens) <= 0:
-        parser.error("Token counts must be positive")
+    if args.input_tokens == "all":
+        args.input_tokens = None
+        if args.length_mode != "natural":
+            parser.error("--input-tokens all requires --length-mode natural")
+    else:
+        try:
+            args.input_tokens = int(args.input_tokens)
+        except ValueError:
+            parser.error("input-tokens must be all or a positive integer")
+        if args.input_tokens <= 0:
+            parser.error("input-tokens must be positive")
+    if args.chunk_tokens <= 0:
+        parser.error("chunk-tokens must be positive")
 
     try:
-        request_rate_for_token_load([args.input_tokens], args.offered_load)
+        request_rate_for_token_load([args.input_tokens or 1], args.offered_load)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -161,7 +184,10 @@ def main():
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=False)
     if config.architectures != ["LlamaForCausalLM"]:
         raise ValueError("The selected model must use LlamaForCausalLM")
-    if args.input_tokens > config.max_position_embeddings:
+    if (
+        args.input_tokens is not None
+        and args.input_tokens > config.max_position_embeddings
+    ):
         raise ValueError("input-tokens exceeds the model context length")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
     dataset_revision = (
@@ -174,10 +200,10 @@ def main():
         revision=dataset_revision,
         streaming=True,
     )
-    prompts, source_rows = [], []
+    prompts, source_rows, excluded_rows = [], [], []
     bos = [tokenizer.bos_token_id] if tokenizer.bos_token_id is not None else []
-    needed = args.input_tokens - len(bos)
-    if needed <= 0:
+    needed = args.input_tokens - len(bos) if args.input_tokens is not None else None
+    if needed is not None and needed <= 0:
         raise ValueError("input-tokens must leave room for text after BOS")
     rows_read = 0
     for row in dataset:
@@ -187,10 +213,17 @@ def main():
             raise TypeError("The dataset text column must contain strings")
         if not text.strip():
             continue
-        tokens = tokenizer.encode(
-            text, add_special_tokens=False, truncation=True, max_length=needed
-        )
+        tokens = encode_record(tokenizer, text, needed)
         if not tokens or (args.length_mode == "fixed" and len(tokens) < needed):
+            continue
+        if len(tokens) + len(bos) > config.max_position_embeddings:
+            excluded_rows.append(
+                {
+                    "row_index": rows_read - 1,
+                    "input_tokens": len(tokens) + len(bos),
+                    "reason": "exceeds_model_context",
+                }
+            )
             continue
         prompts.append(bos + tokens)
         source_rows.append(
@@ -237,6 +270,10 @@ def main():
         "text_column": args.text_column,
         "rows_read": rows_read,
         "source_rows": source_rows,
+        "excluded_rows": excluded_rows,
+        "excluded_context_records": len(excluded_rows),
+        "model_context_length": config.max_position_embeddings,
+        "max_prompt_tokens": max(map(len, prompts)),
         "num_prompts": len(prompts),
         "input_tokens": args.input_tokens,
         "length_mode": args.length_mode,
@@ -254,11 +291,15 @@ def main():
         "arrival_seed": args.arrival_seed,
         "last_arrival_seconds": arrival_times[-1],
         "construction": (
-            "One prefix per distinct dataset row; BOS per prompt; "
+            "One record per prompt; BOS per prompt; "
             + (
                 "rows shorter than the requested length are skipped"
                 if args.length_mode == "fixed"
-                else "natural lengths retained up to input_tokens; empty token sequences skipped"
+                else (
+                    "full records without truncation; empty token sequences skipped"
+                    if args.input_tokens is None
+                    else "natural lengths retained up to input_tokens; empty token sequences skipped"
+                )
             )
         ),
         "workload_sha256": hashlib.sha256(encoded.encode()).hexdigest(),
@@ -271,7 +312,10 @@ def main():
         if args.arrival_pattern == "poisson"
         else "arrival_pattern=burst"
     )
-    print(f"[dynamic-sp] {load_description}", flush=True)
+    print(
+        f"[dynamic-sp] {load_description}; excluded_context_records={len(excluded_rows)}",
+        flush=True,
+    )
     print(
         f"[dynamic-sp] prepared {len(prompts)} prompts; mean_tokens={mean_prompt_tokens:g} "
         f"length_mode={args.length_mode} token_limit={args.input_tokens} "

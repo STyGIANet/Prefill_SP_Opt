@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+original_args=("$@")
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${VIRTUAL_ENV:-}" ]]; then
@@ -11,19 +12,28 @@ elif [[ -x "${repo_root}/.venv/bin/python" ]]; then
 else
     python_bin="python3"
 fi
-model="NousResearch/Meta-Llama-3.1-8B-Instruct"
+# --model gradientai/Llama-3-8B-Instruct-Gradient-1048k
+# --model gradientai/Llama-3-8B-Instruct-262k
+# --model NousResearch/Meta-Llama-3.1-8B-Instruct
+# --eval-dataset emozilla/pg19 --dataset-config default --text-column text --eval-split test
+# --eval-dataset ccdv/arxiv-summarization --dataset-config document --text-column article --eval-split test
+# --eval-dataset ccdv/govreport-summarization --dataset-config document --text-column report --eval-split test
+model="gradientai/Llama-3-8B-Instruct-Gradient-1048k"
 dataset="emozilla/pg19"
-length_mode="fixed"
+length_mode="natural"
 dataset_config="default"
 split="train"
 num_prompts=all
-input_tokens=8192
+input_tokens=all
 chunk_tokens=1024
-max_local_tokens=65536
+max_local_tokens=""
 dtype="bfloat16"
 attention_backend="ring"
 migration_overlap="--migration-overlap"
-scheduler="greedy"
+scheduler="all"
+matrix=0
+warmup_requests=8
+warmup_tokens=8192
 execution_mode="async"
 workload_dir=""
 max_running_requests=32
@@ -34,7 +44,7 @@ arrival_pattern="poisson"
 output_dir=""
 prepare_only=0
 verbose=0
-verify_flag="--verify"
+verify_flag="--no-verify"
 prepare_args=()
 runner_args=()
 tetris_profile=""
@@ -43,7 +53,7 @@ fit_dataset=""
 fit_dataset_config="default"
 fit_split="train"
 fit_num_prompts=256
-fit_input_tokens=8192
+fit_input_tokens=all
 fit_length_mode="natural"
 fit_args=()
 tetris_loads="4096 8192 16384 25000 32768"
@@ -61,7 +71,7 @@ Usage: ./launch_dynamic_sp_8gpu.sh [options] [-- runner-options...]
 
 Options:
   --python PATH          Python in an installed SGLang environment
-  --model ID_OR_PATH     Native Llama checkpoint (default: Llama 3.1 8B)
+  --model ID_OR_PATH     Native Llama checkpoint (default: Gradient Llama 3 8B 1048K)
   --model-revision REV   Model revision resolved to a commit before downloading
   --eval-dataset ID      Evaluation dataset ID (--dataset is an alias)
   --dataset-config NAME Dataset configuration
@@ -69,10 +79,10 @@ Options:
   --eval-split NAME      Evaluation partition, e.g. test (--split alias; default: train)
   --text-column NAME     Dataset text column (default: text)
   --num-prompts N        Evaluation prompts: all or a positive count (default: all)
-  --input-tokens N       Evaluation token length or cap (default: 8192)
-  --length-mode MODE     fixed (default) or natural evaluation lengths
+  --input-tokens N       all (default) preserves full records; integer sets an explicit cap
+  --length-mode MODE     natural (default) or fixed evaluation lengths
   --chunk-tokens N       Prefill tokens per step (default: 1024)
-  --max-local-tokens N   Committed KV capacity per worker (default: 65536)
+  --max-local-tokens N   KV capacity per worker (default: SP 131072; DP 600000)
   --attention-backend NAME  ring (default), gathered, or streaming
   --no-migration-overlap    Disable layer-wise KV migration overlap
   --tetris-fit-method NAME  nonnegative (default) or least-squares
@@ -81,7 +91,7 @@ Options:
   --arrival-seed N      Reproducible arrival RNG seed (default: 0)
   --arrival-pattern P   poisson (default) or burst for saturation tests
   --execution-mode MODE async (default) or sync SP execution
-  --scheduler NAME      greedy (default), tetris, sglang-dp, or module:factory
+  --scheduler NAME      all SP schedulers (default), greedy, tetris, or module:factory
   --tetris-profile PATH  Reuse a frozen profile; skips all Tetris fitting
   --fit-dataset ID       Independent dataset for Tetris threshold selection
   --fit-split NAME       Fitting partition (default: train)
@@ -89,7 +99,7 @@ Options:
   --fit-dataset-revision REV  Fitting dataset revision (default: main)
   --fit-text-column NAME Fitting text column (default: text)
   --fit-num-prompts N    Fitting records (default: 256)
-  --fit-input-tokens N   Fitting token cap (default: 8192)
+  --fit-input-tokens N   Fitting token cap (default: all, no truncation)
   --fit-length-mode MODE natural (default) or fixed fitting lengths
   --tetris-samples PATH  Reuse hardware calibration samples when fitting
   --tetris-loads "R ..." Input-token/s loads (default: "4096 8192 16384 25000 32768")
@@ -103,7 +113,15 @@ Options:
   --output-dir PATH     Fresh directory for workload, manifest, logs, and results
   --workload-dir PATH   Reuse prepared workload and manifest for a matched comparison
   --prepare-only        Prepare evaluation data only, without GPU work or fitting
-  --no-verify           Disable the SP unsharded reference comparison
+  --datasets "P ..."     Dataset presets: pg19 arxiv govreport (default: all three)
+  --attention-backends "B ..."  Matrix backends (default: ring gathered streaming)
+  --kv-transports "T ..." Matrix transports (default: targeted all_gather)
+  --repeats N           Measured trials per combination (default: 1)
+  --progress-interval S Progress refresh seconds (default: 10; 0 disables)
+  --warmup-tokens N     Total sequential warmup token budget (default: 8192)
+  --warmup-requests N   Same-process warmup prompts per trial (default: 8)
+  --verify              Enable reference checking; affects measured performance
+  --no-verify           Disable reference checking (default)
   --verbose             Also show model-loading and library diagnostics
   -h, --help            Show this help
 
@@ -113,7 +131,8 @@ Tetris: ./launch_dynamic_sp_8gpu.sh --scheduler tetris \
   --fit-dataset emozilla/pg19 --fit-split train \
   --eval-dataset emozilla/pg19 --eval-split test --no-verify
 
-For Tetris, provide either --fit-dataset or --tetris-profile. Fitting never
+For a single Tetris run, provide --fit-dataset or --tetris-profile. The matrix
+fits once on PG19/train by default and freezes that profile across all trials. Fitting never
 reads evaluation lengths. --dataset-config, --dataset-revision, --text-column,
 --num-prompts, --input-tokens, and arrival options apply only to evaluation.
 Fitting artifacts are saved under the new run's tetris/ directory.
@@ -132,11 +151,15 @@ while (($#)); do
         --eval-length-mode) set -- --length-mode "${@:2}" ;;
     esac
     case "$1" in
-        --tetris-fit-method|--execution-mode|--workload-dir|--python|--model|--dataset|--dataset-config|--split|--num-prompts|--input-tokens|--chunk-tokens|--max-local-tokens|--output-dir|--model-revision|--dataset-revision|--text-column|--seed|--dtype|--attention-backend|--scheduler|--max-running-requests|--max-batch-tokens|--offered-load|--arrival-seed|--arrival-pattern|--length-mode|--tetris-profile|--fit-dataset|--fit-split|--fit-dataset-config|--fit-dataset-revision|--fit-text-column|--fit-num-prompts|--fit-input-tokens|--fit-length-mode|--tetris-samples|--tetris-loads|--tetris-objective|--tetris-simulation-requests|--kv-transport|--shared-attention)
+        --progress-interval|--datasets|--attention-backends|--kv-transports|--repeats|--warmup-tokens|--warmup-requests|--tetris-fit-method|--execution-mode|--workload-dir|--python|--model|--dataset|--dataset-config|--split|--num-prompts|--input-tokens|--chunk-tokens|--max-local-tokens|--output-dir|--model-revision|--dataset-revision|--text-column|--seed|--dtype|--attention-backend|--scheduler|--max-running-requests|--max-batch-tokens|--offered-load|--arrival-seed|--arrival-pattern|--length-mode|--tetris-profile|--fit-dataset|--fit-split|--fit-dataset-config|--fit-dataset-revision|--fit-text-column|--fit-num-prompts|--fit-input-tokens|--fit-length-mode|--tetris-samples|--tetris-loads|--tetris-objective|--tetris-simulation-requests|--kv-transport|--shared-attention)
             if (($# < 2)) || [[ -z "$2" || "$2" == --* ]]; then
                 printf 'Missing value for %s\n' "$1" >&2; exit 2
             fi
             case "$1" in
+                --datasets|--attention-backends|--kv-transports|--repeats) matrix=1 ;;
+                --progress-interval) runner_args+=(--progress-interval "$2") ;;
+                --warmup-tokens) warmup_tokens="$2" ;;
+                --warmup-requests) warmup_requests="$2" ;;
                 --tetris-fit-method) tetris_fit_method="$2" ;;
                 --execution-mode) execution_mode="$2" ;;
                 --workload-dir) workload_dir="$2" ;;
@@ -177,9 +200,11 @@ while (($#)); do
                 *) prepare_args+=("$1" "$2") ;;
             esac
             shift 2 ;;
+        --allow-profile-backend-mismatch) runner_args+=("$1"); shift ;;
         --prepare-only) prepare_only=1; shift ;;
         --migration-overlap|--no-migration-overlap) migration_overlap="$1"; shift ;;
         --no-verify) verify_flag="--no-verify"; shift ;;
+        --verify) verify_flag="--verify"; shift ;;
         --verbose) verbose=1; shift ;;
         -h|--help) usage; exit 0 ;;
         --) shift; runner_args+=("$@"); break ;;
@@ -187,6 +212,24 @@ while (($#)); do
     esac
 done
 
+if [[ -z "$max_local_tokens" ]]; then
+    if [[ "$scheduler" == sglang-dp ]]; then
+        max_local_tokens=600000
+    else
+        max_local_tokens=131072
+    fi
+fi
+
+export PYTHONPATH="${repo_root}/python${PYTHONPATH:+:${PYTHONPATH}}"
+if ((!prepare_only)) && { [[ "$scheduler" == all ]] || ((matrix)); }; then
+    exec "$python_bin" -m sglang.srt.dynamic_sp.benchmark --launcher "$repo_root/launch_dynamic_sp_8gpu.sh" "${original_args[@]}"
+fi
+if [[ ! "$warmup_requests" =~ ^[0-9]+$ ]]; then
+    printf 'warmup-requests must be nonnegative\n' >&2; exit 2
+fi
+if [[ "$execution_mode" == sync && "$warmup_requests" != 0 ]]; then
+    printf 'Use --warmup-requests 0 for the legacy sync runner\n' >&2; exit 2
+fi
 case "$execution_mode" in
     async|sync) ;;
     *) printf "Execution mode must be async or sync\n" >&2; exit 2 ;;
@@ -202,10 +245,15 @@ case "$dtype" in
     *) printf 'Unsupported dtype: %s\n' "$dtype" >&2; exit 2 ;;
 esac
 
-for value in "$fit_num_prompts" "$fit_input_tokens" "$tetris_simulation_requests" "$input_tokens" "$chunk_tokens" "$max_local_tokens" "$max_running_requests" "$max_batch_tokens"; do
+for value in "$fit_num_prompts" "$tetris_simulation_requests" "$chunk_tokens" "$max_local_tokens" "$max_running_requests" "$max_batch_tokens"; do
     if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
         printf 'Prompt and token counts must be positive integers: %s\n' "$value" >&2
         exit 2
+    fi
+done
+for value in "$input_tokens" "$fit_input_tokens"; do
+    if [[ "$value" != all && ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+        printf 'Token limits must be all or positive integers\n' >&2; exit 2
     fi
 done
 if [[ "$num_prompts" != all && ! "$num_prompts" =~ ^[1-9][0-9]*$ ]]; then
@@ -357,7 +405,7 @@ if [[ "$scheduler" == "sglang-dp" ]]; then
         --model-path "$model_path" --dtype "$dtype" --dp-size 8 \
         --workload "${output_dir}/workload.json" --output "${output_dir}/results.json" \
         --chunk-size "$chunk_tokens" --max-local-tokens "$max_local_tokens" \
-        --max-running-requests "$max_running_requests" "${runner_args[@]}" \
+        --max-running-requests "$max_running_requests" --progress-throughput-target "$offered_load" "${runner_args[@]}" \
         2>&1 | tee "${output_dir}/run.log" | show_logs); then
         tail -n 80 "${output_dir}/run.log" >&2
         exit 1
@@ -369,7 +417,7 @@ if ! (set -o pipefail; "$python_bin" -m torch.distributed.run --standalone --npr
     --workload "${output_dir}/workload.json" --chunk-size "$chunk_tokens" \
     --scheduler "$scheduler" --max-running-requests "$max_running_requests" --max-batch-tokens "$max_batch_tokens" \
     --max-local-tokens "$max_local_tokens" --kv-transport "$kv_transport" --shared-attention "$shared_attention" "$migration_overlap" \
-    --output "${output_dir}/results.json" "$verify_flag" "${runner_args[@]}" \
+    --output "${output_dir}/results.json" --warmup-requests "$warmup_requests" --warmup-tokens "$warmup_tokens" --progress-throughput-target "$offered_load" "$verify_flag" "${runner_args[@]}" \
     2>&1 | tee "${output_dir}/run.log" | show_logs); then
     printf 'Dynamic SP run failed. Diagnostic log: %s/run.log\n' "$output_dir" >&2
     tail -n 80 "${output_dir}/run.log" >&2

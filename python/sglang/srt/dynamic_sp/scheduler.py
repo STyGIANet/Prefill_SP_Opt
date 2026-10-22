@@ -31,6 +31,8 @@ class RequestView:
     end: int = 0
     last_scheduled_version: int = -1
     in_flight: bool = False
+    # Target cursor reserves memory without reporting uncommitted progress.
+    reserved_end: int | None = None
 
     @property
     def complete(self):
