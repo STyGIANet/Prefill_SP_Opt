@@ -176,3 +176,15 @@ Artifacts are saved under the run's `tetris/` directory, including the fitting
 workload, measurement samples, fit diagnostics, frozen profile, and stage logs.
 Reference verification changes execution time. Use `--no-verify` for performance
 experiments and validate correctness separately.
+
+## Frozen profile reuse
+
+The launcher reuses a compatible saved Tetris profile by default, including its
+fitted thresholds. If none is available, it stops instead of starting calibration.
+Use `--recalibrate-tetris` to explicitly repeat GPU calibration and threshold
+selection, or `--tetris-samples PATH` to fit saved measurements and select
+thresholds without GPU profiling. `--tetris-profile PATH` selects a particular
+frozen profile. Training/evaluation overlap checks remain enabled when reusing
+profiles. Changing fitting options alone does not invalidate a frozen profile.
+The benchmark uses one frozen Tetris profile across the entire sweep, including
+backend combinations. Explicit recalibration occurs only once per sweep.

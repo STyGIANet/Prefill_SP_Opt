@@ -50,6 +50,8 @@ runner_args=()
 loongserve_calibration_grid="lean"
 loongserve_calibration_concurrency="parallel"
 loongserve_profile=""
+recalibrate_loongserve=0
+recalibrate_tetris=0
 loongserve_samples=""
 loongserve_max_prefill_seconds=""
 loongserve_calibration_lengths=""
@@ -98,12 +100,14 @@ Options:
   --arrival-pattern P   poisson (default) or burst for saturation tests
   --execution-mode MODE async (default) or sync SP execution
   --scheduler NAME      all SP schedulers (default), greedy, tetris, loongserve, or module:factory
+  --recalibrate-loongserve  Explicitly run new GPU calibration (default: reuse compatible profile)
   --loongserve-profile PATH  Reuse a frozen LoongServe batch latency profile
   --loongserve-samples PATH  Fit existing full-batch GPU measurements
   --loongserve-max-prefill-seconds S  Admission limit (profile value; new profiles: 0.5s)
   --loongserve-calibration-concurrency parallel|serial  Disjoint profiling groups (default: parallel)
   --loongserve-calibration-grid lean|full  Sparse default or exhaustive profiling
   --loongserve-calibration-lengths "N ..."  Absolute lengths override (default: lengths scale with SP degree)
+  --recalibrate-tetris  Explicitly recalibrate and select thresholds (default: reuse compatible profile)
   --tetris-profile PATH  Reuse a frozen profile; skips all Tetris fitting
   --fit-dataset ID       Independent dataset for Tetris threshold selection
   --fit-split NAME       Fitting partition (default: train)
@@ -219,6 +223,8 @@ while (($#)); do
             esac
             shift 2 ;;
         --allow-profile-backend-mismatch) runner_args+=("$1"); shift ;;
+        --recalibrate-tetris) recalibrate_tetris=1; shift ;;
+        --recalibrate-loongserve) recalibrate_loongserve=1; shift ;;
         --prepare-only) prepare_only=1; shift ;;
         --migration-overlap|--no-migration-overlap) migration_overlap="$1"; shift ;;
         --no-verify) verify_flag="--no-verify"; shift ;;
@@ -379,6 +385,16 @@ if [[ "$scheduler" == loongserve ]]; then
     fi
     loongserve_dir="$output_dir/loongserve"
     mkdir -p "$loongserve_dir"
+    if ((recalibrate_loongserve)) && [[ -n "$loongserve_profile" || -n "$loongserve_samples" ]]; then
+        printf 'Choose recalibration or an existing profile/samples, not both.\n' >&2; exit 2
+    fi
+    if ((!recalibrate_loongserve)) && [[ -z "$loongserve_profile" && -z "$loongserve_samples" ]]; then
+        loongserve_profile="$loongserve_dir/profile.json"
+        "$python_bin" -m sglang.srt.dynamic_sp.profile_cache --algorithm loongserve \
+            --work-dir "$repo_root/python/sglang/srt/dynamic_sp/work" --output "$loongserve_profile" \
+            --model-path "$model_path" --dtype "$dtype" --attention-backend "$attention_backend" \
+            --kv-transport "$kv_transport" --shared-attention "$shared_attention" "$migration_overlap"
+    fi
     if [[ -z "$loongserve_profile" ]]; then
         if [[ -z "$loongserve_samples" ]]; then
             loongserve_samples="$loongserve_dir/samples.json"
@@ -410,6 +426,21 @@ fi
 if [[ "$scheduler" == tetris ]]; then
     tetris_dir="$output_dir/tetris"
     mkdir -p "$tetris_dir"
+    if [[ -n "$tetris_profile" && -n "$tetris_samples" ]] || { ((recalibrate_tetris)) && [[ -n "$tetris_profile" || -n "$tetris_samples" ]]; }; then
+        printf 'Choose Tetris recalibration, a profile, or samples, not multiple sources.\n' >&2; exit 2
+    fi
+    if ((!recalibrate_tetris)) && [[ -z "$tetris_profile" && -z "$tetris_samples" ]]; then
+        tetris_profile="$tetris_dir/profile.json"
+        cache_args=()
+        for arg in "${runner_args[@]}"; do
+            if [[ "$arg" == --allow-profile-backend-mismatch ]]; then cache_args+=("$arg"); fi
+        done
+        "$python_bin" -m sglang.srt.dynamic_sp.profile_cache --algorithm tetris \
+            --work-dir "$repo_root/python/sglang/srt/dynamic_sp/work" --output "$tetris_profile" \
+            --model-path "$model_path" --dtype "$dtype" --attention-backend "$attention_backend" \
+            --execution-mode "$execution_mode" --kv-transport "$kv_transport" \
+            --shared-attention "$shared_attention" "$migration_overlap" "${cache_args[@]}"
+    fi
     if [[ -z "$tetris_profile" ]]; then
         printf '[dynamic-sp] Preparing independent Tetris fitting dataset: %s/%s\n' "$fit_dataset" "$fit_split"
         run_logged "$tetris_dir/prepare-fit.log" \

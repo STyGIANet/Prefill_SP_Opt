@@ -153,8 +153,10 @@ def main():
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--output-dir")
     parser.add_argument("--workload-dir")
+    parser.add_argument("--recalibrate-loongserve", action="store_true")
     parser.add_argument("--loongserve-profile")
     parser.add_argument("--loongserve-samples")
+    parser.add_argument("--recalibrate-tetris", action="store_true")
     parser.add_argument("--tetris-profile")
     parser.add_argument("--tetris-samples")
     parser.add_argument("--fit-dataset")
@@ -162,6 +164,16 @@ def main():
     parser.add_argument("--fit-text-column", default="text")
     parser.add_argument("--fit-split", default="train")
     args, common = parser.parse_known_args()
+    if args.recalibrate_loongserve and (
+        args.loongserve_profile or args.loongserve_samples
+    ):
+        parser.error(
+            "Choose recalibration or an existing LoongServe profile/samples, not both"
+        )
+    if args.recalibrate_tetris and (args.tetris_profile or args.tetris_samples):
+        parser.error(
+            "Choose Tetris recalibration or an existing profile/samples, not both"
+        )
     if "--" in common:
         parser.error(
             "Matrix mode accepts named launcher options, not raw runner overrides"
@@ -335,6 +347,8 @@ def main():
                             flags += ["--loongserve-profile", str(profile)]
                         elif args.loongserve_samples:
                             flags += ["--loongserve-samples", args.loongserve_samples]
+                        elif args.recalibrate_loongserve:
+                            flags += ["--recalibrate-loongserve"]
                     if scheduler == "tetris":
                         profile = frozen_profile
                         flags += ["--allow-profile-backend-mismatch"]
@@ -353,6 +367,8 @@ def main():
                             ]
                             if args.tetris_samples:
                                 flags += ["--tetris-samples", args.tetris_samples]
+                            elif args.recalibrate_tetris:
+                                flags += ["--recalibrate-tetris"]
                     print(
                         f"[dynamic-sp] benchmark dataset={name} scheduler={scheduler} backend={backend} transport={transport} repeat={trial}",
                         flush=True,

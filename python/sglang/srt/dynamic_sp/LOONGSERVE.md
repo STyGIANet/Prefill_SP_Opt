@@ -65,9 +65,15 @@ per worker.
   --offered-load 25000 --no-verify
 ```
 
-Without an existing profile, the launcher measures synthetic full-prefill
-batches independently of evaluation data, fits Eq. (7) by ordinary least squares,
-and launches the online workload. Measurements cover every SP degree, equal and
+The launcher reuses the newest compatible saved profile by default and copies
+it into the new run directory. Profiles must match model snapshot, GPU names,
+worker count, precision, execution mode, attention backend, KV transport, shared
+attention and migration overlap. If none matches, the launcher stops without
+profiling. `--recalibrate-loongserve` explicitly measures new synthetic
+full-prefill batches independently of evaluation data, fits Eq. (7) by ordinary
+least squares, and launches the online workload. In a benchmark sweep, explicit
+recalibration runs once per backend/transport pair. Calibration length and grid
+options only affect new measurements; they do not invalidate a frozen profile. Measurements cover every SP degree, equal and
 mixed prompt lengths, and multiple batch sizes. Context- or capacity-infeasible
 calibration points are excluded and recorded. Fitting requires full-rank data
 for every degree. Profiles record measurement provenance and fit residuals.
