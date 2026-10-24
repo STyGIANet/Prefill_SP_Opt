@@ -136,10 +136,11 @@ def main():
                 for history in sorted(set(args.histories)):
                     for length in sorted(set(args.lengths)):
                         total = history + length
-                        if (
-                            total > model.context_length
-                            or (total + degree - 1) // degree > args.max_local_tokens
-                        ):
+                        # Tetris Implementation: short-context checkpoints (e.g. 8K
+                        # Meta-Llama-3-8B) skip grid points beyond the model context.
+                        if total > model.context_length:
+                            continue
+                        if (total + degree - 1) // degree > args.max_local_tokens:
                             raise ValueError(
                                 f"Calibration point ({degree}, {history}, {length}) exceeds capacity"
                             )

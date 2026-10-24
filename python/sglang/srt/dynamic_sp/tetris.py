@@ -42,12 +42,18 @@ class LatencyModel:
             + self.d * length * length
         )
 
-    def tokens(self, history: int, budget: float, limit: int) -> int:
+    def tokens(
+        self, history: int, budget: float, limit: int, solver: str = "newton"
+    ) -> int:
         """Largest integer chunk fitting the budget, including constant overhead.
 
-        Integer bisection avoids cancellation in the quadratic formula and handles
-        linear models. Complexity is logarithmic in prompt length.
+        Both solvers return the same integer; integer bisection avoids cancellation
+        in the quadratic formula and is kept as a reference.
         """
+        if solver == "newton":
+            return self._tokens_newton(history, budget, limit)
+        if solver != "bisection":
+            raise ValueError(f"Unknown chunk length solver: {solver}")
         low, high = 0, limit
         while low < high:
             mid = (low + high + 1) // 2
@@ -56,6 +62,33 @@ class LatencyModel:
             else:
                 high = mid - 1
         return low
+
+    # Tetris Implementation
+    def _tokens_newton(self, history, budget, limit):
+        """Paper Alg. 3: Newton's method on a + (b + c*C)*L + d*L^2 - budget = 0.
+
+        The latency is convex and increasing for L >= 0, so iterating from the
+        upper bound decreases monotonically to the root. The integer answer is
+        then corrected to the same largest feasible length bisection returns.
+        """
+        if limit <= 0 or self.seconds(history, 1) > budget:
+            return 0
+        if self.seconds(history, limit) <= budget:
+            return limit
+        slope = self.b + self.c * history
+        length = float(limit)
+        for _ in range(64):
+            residual = self.a + slope * length + self.d * length * length - budget
+            step = residual / (slope + 2 * self.d * length)
+            length -= step
+            if abs(step) < 1e-6:
+                break
+        count = min(limit, max(1, int(length)))
+        while count > 1 and self.seconds(history, count) > budget:
+            count -= 1
+        while count < limit and self.seconds(history, count + 1) <= budget:
+            count += 1
+        return count
 
 
 @dataclass(frozen=True)
@@ -75,10 +108,11 @@ class CDSPPlanner:
     double-counting previous chunks. Memoization does not prune candidates.
     """
 
-    def __init__(self, models, nodes, min_chunk_tokens=1):
+    def __init__(self, models, nodes, min_chunk_tokens=1, chunk_solver="newton"):
         self.models = dict(sorted(models.items()))
         self.nodes = tuple(nodes)
         self.min_chunk_tokens = min_chunk_tokens
+        self.chunk_solver = chunk_solver
         if not self.nodes or any(type(n) is not int or n < 0 for n in self.nodes):
             raise ValueError("nodes must map every rank to a nonnegative node ID")
         if not self.models or any(
@@ -190,9 +224,13 @@ class CDSPPlanner:
                     start = max(cursor, max(queues[r] for r in ranks))
                     next_start = max(cursor, max(queues[r] for r in next_ranks))
                     count = self.models[current].tokens(
-                        prefix, next_start - start, remaining
+                        prefix, next_start - start, remaining, self.chunk_solver
                     )
-                    if count < self.min_chunk_tokens or count >= remaining:
+                    # Tetris Implementation: "too short to yield benefits" (Alg. 1)
+                    # applies to multi-instance groups; a single instance always
+                    # benefits from filling its idle gap.
+                    minimum = self.min_chunk_tokens if current > 1 else 1
+                    if count < minimum or count >= remaining:
                         continue
                     finish = start + self.models[current].seconds(prefix, count)
                     rest = search(
@@ -261,7 +299,7 @@ class TetrisScheduler:
     never count as actual progress; request/KV changes require successful commit.
     """
 
-    def __init__(self, config: SchedulerConfig, profile):
+    def __init__(self, config: SchedulerConfig, profile, chunk_solver="newton"):
         self.config = config
         self.profile = profile
         self.models = {
@@ -271,7 +309,7 @@ class TetrisScheduler:
         if len(nodes) != config.world_size:
             raise ValueError("Profile topology does not match world size")
         self.planner = CDSPPlanner(
-            self.models, nodes, profile.get("min_chunk_tokens", 1)
+            self.models, nodes, profile.get("min_chunk_tokens", 1), chunk_solver
         )
         self.window = ArrivalWindow(profile["arrival_window_seconds"], unit="requests")
         self.calendar = ReservationCalendar(config.world_size)
@@ -303,19 +341,20 @@ class TetrisScheduler:
         self.execution_mode = "sync"
 
     @classmethod
-    def from_file(cls, config, path):
+    def from_file(cls, config, path, chunk_solver="newton"):
         profile = json.loads(Path(path).read_text())
         if profile.get("schema_version") != 2:
             raise ValueError(
                 "Unsupported Tetris profile schema; refit for persistent reservations"
             )
-        return cls(config, profile)
+        return cls(config, profile, chunk_solver)
 
     def metadata(self):
         canonical = json.dumps(self.profile, sort_keys=True).encode()
         return {
             "profile": self.profile,
             "profile_sha256": hashlib.sha256(canonical).hexdigest(),
+            "chunk_solver": self.planner.chunk_solver,
             "execution": self.execution_mode,
             "last_decision": self.last_decision,
         }

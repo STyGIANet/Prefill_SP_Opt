@@ -12,6 +12,7 @@ from sglang.srt.dynamic_sp.arrivals import (
     poisson_arrival_times,
     request_rate_for_token_load,
 )
+from sglang.srt.dynamic_sp.llama import SUPPORTED_ARCHITECTURES
 
 
 def make_schedule(prompts, chunk_tokens, world_size=8, seed=0):
@@ -73,6 +74,25 @@ def encode_record(tokenizer, text, limit):
         options["max_length"] = limit
     tokens = tokenizer.encode(text, **options)
     return tokens
+
+
+# Tetris Implementation
+def local_rows(path, split):
+    """Rows of a local JSON-lines dataset; every tenth row is "test", the rest "train"."""
+    if split not in ("train", "test"):
+        raise ValueError("Local datasets have only the train and test partitions")
+    with open(path) as stream:
+        for index, line in enumerate(stream):
+            if (index % 10 == 0) == (split == "test"):
+                yield index, json.loads(line)
+
+
+# Tetris Implementation
+def record_text(value):
+    """Plain text, or the first user turn of a chat record (e.g. LMSYS-Chat-1M)."""
+    if isinstance(value, list):
+        return next((turn["content"] for turn in value if turn["role"] == "user"), "")
+    return value
 
 
 def main():
@@ -182,33 +202,43 @@ def main():
             ],
         )
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=False)
-    if config.architectures != ["LlamaForCausalLM"]:
-        raise ValueError("The selected model must use LlamaForCausalLM")
+    if config.architectures[0] not in SUPPORTED_ARCHITECTURES:
+        raise ValueError(
+            f"The selected model must use {' or '.join(SUPPORTED_ARCHITECTURES)}"
+        )
     if (
         args.input_tokens is not None
         and args.input_tokens > config.max_position_embeddings
     ):
         raise ValueError("input-tokens exceeds the model context length")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
-    dataset_revision = (
-        HfApi().dataset_info(args.dataset, revision=args.dataset_revision).sha
-    )
-    dataset = load_dataset(
-        args.dataset,
-        args.dataset_config,
-        split=args.split,
-        revision=dataset_revision,
-        streaming=True,
-    )
+    local_dataset = Path(args.dataset).expanduser()
+    if local_dataset.is_file():
+        stat = local_dataset.stat()
+        args.dataset = str(local_dataset.resolve())
+        dataset_revision = f"local-{stat.st_size}-{int(stat.st_mtime)}"
+        rows = local_rows(local_dataset, args.split)
+    else:
+        dataset_revision = (
+            HfApi().dataset_info(args.dataset, revision=args.dataset_revision).sha
+        )
+        dataset = load_dataset(
+            args.dataset,
+            args.dataset_config,
+            split=args.split,
+            revision=dataset_revision,
+            streaming=True,
+        )
+        rows = enumerate(dataset)
     prompts, source_rows, excluded_rows = [], [], []
     bos = [tokenizer.bos_token_id] if tokenizer.bos_token_id is not None else []
     needed = args.input_tokens - len(bos) if args.input_tokens is not None else None
     if needed is not None and needed <= 0:
         raise ValueError("input-tokens must leave room for text after BOS")
     rows_read = 0
-    for row in dataset:
-        rows_read += 1
-        text = row[args.text_column]
+    for row_index, row in rows:
+        rows_read = row_index + 1
+        text = record_text(row[args.text_column])
         if not isinstance(text, str):
             raise TypeError("The dataset text column must contain strings")
         if not text.strip():
@@ -219,7 +249,7 @@ def main():
         if len(tokens) + len(bos) > config.max_position_embeddings:
             excluded_rows.append(
                 {
-                    "row_index": rows_read - 1,
+                    "row_index": row_index,
                     "input_tokens": len(tokens) + len(bos),
                     "reason": "exceeds_model_context",
                 }
@@ -228,7 +258,7 @@ def main():
         prompts.append(bos + tokens)
         source_rows.append(
             {
-                "row_index": rows_read - 1,
+                "row_index": row_index,
                 "title": row.get("short_book_title"),
                 "url": row.get("url"),
             }

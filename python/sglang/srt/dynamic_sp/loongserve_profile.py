@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 
-def fit(raw, max_prefill_seconds=0.5):
+def fit(raw, max_prefill_seconds=0.5, max_validation_error=0.25):
     models, diagnostics = {}, {}
     world = raw["metadata"]["world_size"]
     for degree in range(1, world + 1):
@@ -74,9 +74,9 @@ def fit(raw, max_prefill_seconds=0.5):
         diagnostics[str(degree)]["max_validation_relative_error"] = max(
             (e["relative_error"] for e in errors), default=None
         )
-        if any(e["relative_error"] > 0.25 for e in errors):
+        if any(e["relative_error"] > max_validation_error for e in errors):
             raise ValueError(
-                f"SP={degree}: held-out latency error exceeds 25%; use a wider calibration range or --grid full. Validation points were not used for fitting."
+                f"SP={degree}: held-out latency error exceeds {max_validation_error:.0%}; use a wider calibration range or --grid full. Validation points were not used for fitting."
             )
     if not math.isfinite(max_prefill_seconds) or max_prefill_seconds <= 0:
         raise ValueError("Prefill time limit must be positive")
@@ -89,6 +89,7 @@ def fit(raw, max_prefill_seconds=0.5):
         "fit": diagnostics,
         "fit_method": "ordinary-least-squares",
         "max_prefill_seconds": max_prefill_seconds,
+        "max_validation_error": max_validation_error,
         "samples_sha256": hashlib.sha256(
             json.dumps(raw, sort_keys=True).encode()
         ).hexdigest(),
@@ -105,8 +106,20 @@ def main():
         default=0.5,
         help="Admission threshold; upstream default is 500 ms; calibrate for your hardware",
     )
+    # Tetris Implementation: short-prompt workloads (e.g. LMSYS) leave per-request
+    # overhead at high SP that the a + b*sum(n) + c*sum(n^2) model cannot express.
+    parser.add_argument(
+        "--max-validation-error",
+        type=float,
+        default=0.25,
+        help="Largest accepted held-out relative latency error (default: 0.25)",
+    )
     args = parser.parse_args()
-    profile = fit(json.loads(Path(args.samples).read_text()), args.max_prefill_seconds)
+    profile = fit(
+        json.loads(Path(args.samples).read_text()),
+        args.max_prefill_seconds,
+        args.max_validation_error,
+    )
     target = Path(args.output)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(".tmp")

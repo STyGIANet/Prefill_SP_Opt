@@ -64,7 +64,14 @@ fit_num_prompts=256
 fit_input_tokens=all
 fit_length_mode="natural"
 fit_args=()
-tetris_loads="4096 8192 16384 25000 32768"
+tetris_loads=""
+# Tetris Implementation: profile thresholds at request rates (the paper's axis);
+# tokens/s loads come from the fitting workload's mean prompt length.
+tetris_request_rates="0.5 1 2 4 8 16"
+# Tetris Implementation: minimum chunk for multi-GPU groups (Alg. 1 "too short
+# to yield benefits"); 0 disables the check. 256 is arbitrary.
+tetris_min_chunk_tokens=256
+tetris_chunk_solver="newton"
 tetris_objective="mean"
 tetris_simulation_requests=1000
 kv_transport="targeted"
@@ -120,7 +127,10 @@ Options:
   --fit-input-tokens N   Fitting token cap (default: all, no truncation)
   --fit-length-mode MODE natural (default) or fixed fitting lengths
   --tetris-samples PATH  Reuse hardware calibration samples when fitting
-  --tetris-loads "R ..." Input-token/s loads (default: "4096 8192 16384 25000 32768")
+  --tetris-loads "R ..." Input-token/s loads; overrides --tetris-request-rates
+  --tetris-request-rates "R ..."  Request/s profiling grid (default: "0.5 1 2 4 8 16")
+  --tetris-min-chunk-tokens N  Minimum chunk on multi-GPU groups; 0 disables (default: 256)
+  --tetris-chunk-solver NAME  newton (default) or bisection
   --tetris-objective NAME mean (default), p50, or p95 per-prompt TTFT
   --tetris-simulation-requests N  Simulated requests per load (default: 1000)
   --kv-transport NAME    targeted (default) or all_gather
@@ -169,7 +179,7 @@ while (($#)); do
         --eval-length-mode) set -- --length-mode "${@:2}" ;;
     esac
     case "$1" in
-        --loongserve-calibration-concurrency|--loongserve-calibration-grid|--loongserve-profile|--loongserve-samples|--loongserve-max-prefill-seconds|--loongserve-calibration-lengths|--progress-interval|--datasets|--attention-backends|--kv-transports|--repeats|--warmup-tokens|--warmup-requests|--tetris-fit-method|--execution-mode|--workload-dir|--python|--model|--dataset|--dataset-config|--split|--num-prompts|--input-tokens|--chunk-tokens|--max-local-tokens|--output-dir|--model-revision|--dataset-revision|--text-column|--seed|--dtype|--attention-backend|--scheduler|--max-running-requests|--max-batch-tokens|--offered-load|--arrival-seed|--arrival-pattern|--length-mode|--tetris-profile|--fit-dataset|--fit-split|--fit-dataset-config|--fit-dataset-revision|--fit-text-column|--fit-num-prompts|--fit-input-tokens|--fit-length-mode|--tetris-samples|--tetris-loads|--tetris-objective|--tetris-simulation-requests|--kv-transport|--shared-attention|--sp-sizes|--size-thresholds)
+        --loongserve-calibration-concurrency|--loongserve-calibration-grid|--loongserve-profile|--loongserve-samples|--loongserve-max-prefill-seconds|--loongserve-calibration-lengths|--progress-interval|--datasets|--attention-backends|--kv-transports|--repeats|--warmup-tokens|--warmup-requests|--tetris-fit-method|--execution-mode|--workload-dir|--python|--model|--dataset|--dataset-config|--split|--num-prompts|--input-tokens|--chunk-tokens|--max-local-tokens|--output-dir|--model-revision|--dataset-revision|--text-column|--seed|--dtype|--attention-backend|--scheduler|--max-running-requests|--max-batch-tokens|--offered-load|--arrival-seed|--arrival-pattern|--length-mode|--tetris-profile|--fit-dataset|--fit-split|--fit-dataset-config|--fit-dataset-revision|--fit-text-column|--fit-num-prompts|--fit-input-tokens|--fit-length-mode|--tetris-samples|--tetris-loads|--tetris-request-rates|--tetris-min-chunk-tokens|--tetris-chunk-solver|--tetris-objective|--tetris-simulation-requests|--kv-transport|--shared-attention|--sp-sizes|--size-thresholds)
             if (($# < 2)) || [[ -z "$2" || "$2" == --* ]]; then
                 printf 'Missing value for %s\n' "$1" >&2; exit 2
             fi
@@ -200,6 +210,9 @@ while (($#)); do
                 --fit-length-mode) fit_length_mode="$2" ;;
                 --tetris-samples) tetris_samples="$2" ;;
                 --tetris-loads) tetris_loads="$2" ;;
+                --tetris-request-rates) tetris_request_rates="$2" ;;
+                --tetris-min-chunk-tokens) tetris_min_chunk_tokens="$2" ;;
+                --tetris-chunk-solver) tetris_chunk_solver="$2" ;;
                 --tetris-objective) tetris_objective="$2" ;;
                 --tetris-simulation-requests) tetris_simulation_requests="$2" ;;
                 --kv-transport) kv_transport="$2" ;;
@@ -295,6 +308,13 @@ case "$kv_transport:$shared_attention" in
     targeted:auto|targeted:sdpa|all_gather:auto|all_gather:sdpa) ;;
     *) printf 'Invalid KV transport or shared attention choice\n' >&2; exit 2 ;;
 esac
+case "$tetris_chunk_solver" in
+    newton|bisection) ;;
+    *) printf 'Tetris chunk solver must be newton or bisection\n' >&2; exit 2 ;;
+esac
+if [[ ! "$tetris_min_chunk_tokens" =~ ^[0-9]+$ ]]; then
+    printf 'tetris-min-chunk-tokens must be a nonnegative integer\n' >&2; exit 2
+fi
 case "$tetris_objective" in
     mean|p50|p95) ;;
     *) printf 'Tetris objective must be mean, p50, or p95\n' >&2; exit 2 ;;
@@ -469,24 +489,31 @@ if [[ "$scheduler" == tetris ]]; then
         printf '[dynamic-sp] Fitting hardware latency models\n'
         run_logged "$tetris_dir/fit.log" \
             "$python_bin" -m sglang.srt.dynamic_sp.tetris_profile fit \
-            --samples "$tetris_samples" --method "$tetris_fit_method" --window-seconds 30 --min-chunk-tokens 1 \
+            --samples "$tetris_samples" --method "$tetris_fit_method" --window-seconds 30 --min-chunk-tokens "$(( tetris_min_chunk_tokens > 0 ? tetris_min_chunk_tokens : 1 ))" \
             --output "$tetris_dir/latency.json"
         printf '[dynamic-sp] Selecting Tetris thresholds from fitting data only\n'
-        read -r -a load_values <<< "$tetris_loads"
+        if [[ -n "$tetris_loads" ]]; then
+            read -r -a load_values <<< "$tetris_loads"
+            load_args=(--loads "${load_values[@]}")
+        else
+            read -r -a rate_values <<< "$tetris_request_rates"
+            load_args=(--request-rates "${rate_values[@]}")
+        fi
         tetris_profile="$tetris_dir/profile.json"
         run_logged "$tetris_dir/search.log" \
             "$python_bin" -m sglang.srt.dynamic_sp.tetris_profile search \
             --profile "$tetris_dir/latency.json" \
             --workload "$tetris_dir/fit-workload/workload.json" \
             --training-manifest "$tetris_dir/fit-workload/manifest.json" \
-            --loads "${load_values[@]}" --requests "$tetris_simulation_requests" \
+            "${load_args[@]}" --requests "$tetris_simulation_requests" \
+            --chunk-solver "$tetris_chunk_solver" \
             --seed 0 --objective "$tetris_objective" --output "$tetris_profile"
     else
         printf '[dynamic-sp] Reusing frozen Tetris profile: %s\n' "$tetris_profile"
     fi
     "$python_bin" -m sglang.srt.dynamic_sp.tetris_profile check-data \
         --profile "$tetris_profile" --evaluation-manifest "$output_dir/manifest.json"
-    runner_args+=(--tetris-profile "$tetris_profile")
+    runner_args+=(--tetris-profile "$tetris_profile" --tetris-chunk-solver "$tetris_chunk_solver")
 fi
 printf '[dynamic-sp] Loading model; full diagnostics: %s/run.log\n' "$output_dir"
 if [[ "$scheduler" == "sglang-dp" ]]; then

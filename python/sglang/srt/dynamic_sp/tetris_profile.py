@@ -153,7 +153,14 @@ def simulate(planner, trace, improvement_rate):
 
 
 def search_thresholds(
-    profile, lengths, loads, rates, count=1000, seed=0, objective="mean"
+    profile,
+    lengths,
+    loads,
+    rates,
+    count=1000,
+    seed=0,
+    objective="mean",
+    chunk_solver="newton",
 ):
     if not rates or any(not math.isfinite(r) or not 0 <= r < 1 for r in rates):
         raise ValueError("Search rates must lie in [0, 1)")
@@ -162,7 +169,9 @@ def search_thresholds(
     if objective not in ("mean", "p50", "p95"):
         raise ValueError("Objective must be mean, p50, or p95 TTFT")
     models = {int(s): LatencyModel(**values) for s, values in profile["models"].items()}
-    planner = CDSPPlanner(models, profile["nodes"], profile.get("min_chunk_tokens", 1))
+    planner = CDSPPlanner(
+        models, profile["nodes"], profile.get("min_chunk_tokens", 1), chunk_solver
+    )
     thresholds, report = [], []
     for load in sorted(set(loads)):
         trace = arrival_trace(lengths, load, count, seed)
@@ -260,8 +269,18 @@ def main():
         required=True,
         help="Prepared workload.json, or JSON list of token lengths",
     )
+    loads = search.add_mutually_exclusive_group(required=True)
+    loads.add_argument("--loads", type=float, nargs="+", help="Input tokens per second")
+    # Tetris Implementation: the paper profiles request rates; convert them to
+    # token loads with the fitting workload's mean prompt length.
+    loads.add_argument(
+        "--request-rates",
+        type=float,
+        nargs="+",
+        help="Requests per second, e.g. 0.5 1 2 4 8 16",
+    )
     search.add_argument(
-        "--loads", type=float, nargs="+", required=True, help="Input tokens per second"
+        "--chunk-solver", choices=("newton", "bisection"), default="newton"
     )
     search.add_argument(
         "--rates", type=float, nargs="+", default=[i / 100 for i in range(5, 76, 5)]
@@ -313,14 +332,18 @@ def main():
         if isinstance(workload, dict):
             workload = workload["requests"]
         lengths = [len(r["token_ids"]) if isinstance(r, dict) else r for r in workload]
+        loads = args.loads or [
+            rate * statistics.mean(lengths) for rate in args.request_rates
+        ]
         profile["thresholds"], profile["simulation"] = search_thresholds(
             profile,
             lengths,
-            args.loads,
+            loads,
             args.rates,
             args.requests,
             args.seed,
             args.objective,
+            args.chunk_solver,
         )
         profile["threshold_status"] = "simulated"
         encoded = Path(args.workload).read_bytes()

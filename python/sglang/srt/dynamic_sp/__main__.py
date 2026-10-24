@@ -165,6 +165,13 @@ def main():
         "--tetris-profile",
         help="Fitted latency models and simulated load thresholds JSON",
     )
+    # Tetris Implementation
+    parser.add_argument(
+        "--tetris-chunk-solver",
+        choices=("newton", "bisection"),
+        default="newton",
+        help="Chunk length solver for Tetris Alg. 3 (paper: Newton's method)",
+    )
     parser.add_argument(
         "--loongserve-profile", help="LoongServe batch latency SIB JSON"
     )
@@ -291,14 +298,14 @@ def main():
             elif args.scheduler == "request":
                 from sglang.srt.dynamic_sp.dynamic_scheduler import RequestSpScheduler
 
-                policy = RequestSpScheduler(
-                    config, args.sp_sizes, args.size_thresholds
-                )
+                policy = RequestSpScheduler(config, args.sp_sizes, args.size_thresholds)
             elif args.scheduler in ("tetris", "loongserve"):
                 if args.scheduler == "tetris":
                     from sglang.srt.dynamic_sp.tetris import TetrisScheduler
 
-                    policy = TetrisScheduler.from_file(config, args.tetris_profile)
+                    policy = TetrisScheduler.from_file(
+                        config, args.tetris_profile, args.tetris_chunk_solver
+                    )
                 else:
                     from sglang.srt.dynamic_sp.loongserve import LoongServeScheduler
 

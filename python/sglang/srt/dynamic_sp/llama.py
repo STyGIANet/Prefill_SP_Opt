@@ -1,18 +1,23 @@
 # Copyright 2026 SGLang Team
 # SPDX-License-Identifier: Apache-2.0
-"""Native SGLang dense Llama adapter for dynamically owned token rows."""
+"""Native SGLang dense Llama / Qwen3 adapter for dynamically owned token rows."""
 
 import torch.nn.functional as F
+
+# Tetris Implementation: Qwen3 shares the Llama layer layout; its QK-norm lives in
+# Qwen3Attention.forward_prepare_native.
+SUPPORTED_ARCHITECTURES = ("LlamaForCausalLM", "Qwen3ForCausalLM")
 
 
 class SGLangLlamaPrefillModel:
     def __init__(self, model):
         from sglang.srt.models.llama import LlamaForCausalLM
+        from sglang.srt.models.qwen3 import Qwen3ForCausalLM
         from sglang.srt.runtime_context import get_parallel
 
-        if type(model) is not LlamaForCausalLM:
+        if type(model) not in (LlamaForCausalLM, Qwen3ForCausalLM):
             raise ValueError(
-                "Dynamic SP currently supports native LlamaForCausalLM only"
+                "Dynamic SP currently supports native LlamaForCausalLM and Qwen3ForCausalLM only"
             )
         parallel = get_parallel()
         if parallel.tp_size != 1 or parallel.pp_size != 1:
@@ -20,7 +25,9 @@ class SGLangLlamaPrefillModel:
         if model.quant_config is not None:
             raise ValueError("Dynamic SP does not support quantized weights")
         cfg = model.config
-        if getattr(cfg, "sliding_window", None) is not None:
+        if getattr(cfg, "sliding_window", None) is not None and getattr(
+            cfg, "use_sliding_window", True
+        ):
             raise ValueError("Sliding-window attention is not supported")
         if getattr(cfg, "attention_chunk_size", None) is not None:
             raise ValueError("Chunk-local attention is not supported")
@@ -89,8 +96,10 @@ def load_native_llama(model_path, *, dtype="bfloat16", device="cuda", local_rank
     # Logical model rank is zero on every replica; transport uses WORLD rank.
     publish(args, role="scheduler", ranks=SpawnRanks(world_rank=0, gpu_id=local_rank))
     config = ModelConfig.from_server_args(args)
-    if config.hf_config.architectures != ["LlamaForCausalLM"]:
-        raise ValueError("Use a dense LlamaForCausalLM checkpoint for dynamic SP")
+    if config.hf_config.architectures[0] not in SUPPORTED_ARCHITECTURES:
+        raise ValueError(
+            f"Use a dense {' or '.join(SUPPORTED_ARCHITECTURES)} checkpoint for dynamic SP"
+        )
     init_distributed_environment(
         world_size=dist.get_world_size(),
         rank=dist.get_rank(),
