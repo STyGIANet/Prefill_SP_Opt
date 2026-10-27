@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv*/
+.pytest_cache/
+vendor/
+dist/
+# JIT build output of the corrected kernel is machine-specific.
+kernels/*/cached_ops/*
+!kernels/*/cached_ops/.gitkeep
+# New runs; checked-in results are added explicitly.
+results/phase-c-*-*/

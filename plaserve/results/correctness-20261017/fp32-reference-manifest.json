@@ -1,0 +1,17 @@
+{
+  "status": "completed",
+  "model": "Qwen/Qwen2.5-7B",
+  "torch": "2.9.1+cu128",
+  "transformers": "4.57.1",
+  "cuda_visible_devices": "2",
+  "dtype": "float32",
+  "attention": "eager",
+  "tf32": false,
+  "inputs_sha256": "49830edb4590efd7ec73d183b4ecabaafab06bf228209aa129734895ae324d58",
+  "parameter_dtypes": [
+    "torch.float32"
+  ],
+  "revision": "d149729398750b98c0af14eb82c78cfe92750796",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "points": 5
+}

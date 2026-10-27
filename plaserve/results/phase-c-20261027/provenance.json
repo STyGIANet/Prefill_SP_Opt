@@ -1,0 +1,12 @@
+{
+  "vendor_head": "88b986375b531b2f09261b9f44628a24a9c0d6d7",
+  "vendor_diff": "vendor.diff",
+  "vendor_diff_sha256": "da2d03fadfdb9d927155798fc0b657235a0223ab9ddb78204c22c5c2baad6a35",
+  "scripts_sha256": {
+    "scripts/run_phase_c.py": "1dbac1bf07671dc2258c6d3ac7debcb1b33964294d3673996ce00fb7dce14541",
+    "scripts/run_bench_fixed_kernels.sh": "11f4940692ba967fcc06331d0c6bab3bb62cc6c8bc8b7bc5f3b3a01b43147562",
+    "scripts/prepare_bench_fixed.py": "62329dfefdbcc926811aa69c8dfef0ceaa55b67ece85cdfaf7bf0bec2574473e",
+    "scripts/validate_bench_results.py": "594b27e93bee86f1e42b7c3730e70b108d06ab8c85ba612639cbd9a0d2032f9f",
+    "scripts/monitor_bench_gpus.py": "b0a996f02a378b569ecbb5b77833ed7b708f0a12af7951f91b4f902e99ed6179"
+  }
+}

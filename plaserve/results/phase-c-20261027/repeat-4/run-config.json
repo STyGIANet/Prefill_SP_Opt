@@ -1,0 +1,7 @@
+{
+  "NUM_PROMPTS": "500",
+  "CONCURRENCY_LEVELS": "1 4 8 16",
+  "BACKEND": "nixl",
+  "LAPS_FLASHINFER_KERNEL_ROOT": "/home/apal/prefill-optimization/PLAserve/results/flashinfer-mask-experiment/saturating-4fbcdb804781",
+  "CUDA_VISIBLE_DEVICES": "2,3,4,5"
+}

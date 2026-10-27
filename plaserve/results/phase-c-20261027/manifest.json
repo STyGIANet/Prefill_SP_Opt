@@ -1,0 +1,22 @@
+{
+  "status": "stopped",
+  "completed_repeats": [
+    "/home/apal/prefill-optimization/PLAserve/results/phase-c-20261027-173939/campaign/repeat-1",
+    "/home/apal/prefill-optimization/PLAserve/results/phase-c-20261027-173939/campaign/repeat-2",
+    "/home/apal/prefill-optimization/PLAserve/results/phase-c-20261027-173939/campaign/repeat-3"
+  ],
+  "planned_repeats": 3,
+  "num_prompts": 500,
+  "concurrency": [
+    1,
+    4,
+    8,
+    16
+  ],
+  "policies": [
+    "vanilla_sglang",
+    "disaggregation",
+    "laps"
+  ],
+  "error": "RuntimeError('Other user appeared on GPUs 2-5 in repeat 3; stopping after completed repeat. See interference.json')"
+}
