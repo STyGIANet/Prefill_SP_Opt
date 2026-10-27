@@ -9,6 +9,7 @@ coordinator ticket order. Group creation is local to members, and cached.
 """
 
 import contextvars
+import itertools
 import os
 import socket
 import threading
@@ -19,6 +20,13 @@ from multiprocessing.connection import Client, Listener, wait
 import torch
 import torch.distributed as dist
 from sglang.srt.dynamic_sp.communication import GroupCommunication, rendezvous_store
+from sglang.srt.dynamic_sp.decode import (
+    DecodeInstanceRank,
+    DecodeStep,
+    KVTransfer,
+    operation_response,
+    send_rows,
+)
 from sglang.srt.dynamic_sp.engine import DynamicSPPrefillEngine, PlanRejected, _State
 from sglang.srt.dynamic_sp.plan import PrefillPlan, PromptStep
 from sglang.srt.utils.monotonic_clock import monotonic_clock_domain
@@ -34,6 +42,25 @@ def clock_domain():
     if domain is None:
         raise RuntimeError("Async measurement requires Linux CLOCK_MONOTONIC")
     return domain
+
+
+def prewarm_memberships(world_size, mode):
+    """Rank sets whose groups are built at startup: none, contiguous windows, or all."""
+    if mode == "none":
+        return ()
+    if mode == "contiguous":
+        return tuple(
+            tuple(range(start, start + size))
+            for size in range(1, world_size + 1)
+            for start in range(world_size - size + 1)
+        )
+    if mode == "all":
+        return tuple(
+            members
+            for size in range(1, world_size + 1)
+            for members in itertools.combinations(range(world_size), size)
+        )
+    raise ValueError(f"Unknown prewarm mode {mode!r}")
 
 
 def _nodelay(connection):
@@ -54,7 +81,17 @@ class Operation:
 
 class GroupWorker:
     def __init__(
-        self, model, options, *, store, verify=False, atol=1e-4, rtol=1e-4, timeout=600
+        self,
+        model,
+        options,
+        *,
+        store,
+        verify=False,
+        atol=1e-4,
+        rtol=1e-4,
+        timeout=600,
+        decode_instances=(),
+        decode_kv_tokens=0,
     ):
         self.model = model
         self.options = dict(options)
@@ -74,9 +111,19 @@ class GroupWorker:
             options.get("attention_backend", "gathered"),
             execution_tokens=execution_tokens,
         )
+        self.decode = next(
+            (
+                DecodeInstanceRank(model, members, self.rank, decode_kv_tokens)
+                for members in decode_instances
+                if self.rank in members
+            ),
+            None,
+        )
 
     def engine(self, operation):
-        members = operation.members
+        return self._group(operation.members, operation.ticket)
+
+    def _group(self, members, ticket):
         if members not in self.groups:
             communication = GroupCommunication(
                 self.store, members, self.model.device, self.timeout
@@ -88,8 +135,86 @@ class GroupWorker:
                 kv_pool=self.kv_pool,
                 **self.options,
             )
-            self.groups[members] = (operation.ticket, communication, engine)
+            self.groups[members] = (ticket, communication, engine)
         return self.groups[members][-1]
+
+    def prewarm(self, memberships):
+        """Build groups and connect every NCCL path the engine uses.
+
+        Every rank walks memberships in the same order, so overlapping groups
+        cannot deadlock. NCCL connects lazily per collective, hence one of each.
+        """
+        device = self.model.device
+        for ticket, members in enumerate(memberships, start=-len(memberships)):
+            if self.rank not in members:
+                continue
+            self._group(members, ticket)
+            communication = self.groups[members][1]
+            size = communication.world_size
+            value = torch.zeros(size, device=device)
+            communication.gather(torch.empty(size * size, device=device), value)
+            communication.exchange(
+                torch.empty_like(value), value, [1] * size, [1] * size
+            )
+            communication.broadcast(value, 0)
+            communication.data.allreduce([value]).wait()
+            if size > 1:
+                # Ring attention and KV handoff use point-to-point paths.
+                received = torch.empty_like(value)
+                communication.data._start_coalescing()
+                communication.data.send([value], (communication.rank + 1) % size, 0)
+                communication.data.recv([received], (communication.rank - 1) % size, 0)
+                communication.data._end_coalescing().wait()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+    def run(self, operation):
+        if isinstance(operation, KVTransfer):
+            return self.transfer(operation)
+        if isinstance(operation, DecodeStep):
+            started = time.perf_counter()
+            self._group(operation.members, operation.ticket)
+            outputs, finished = self.decode.step(
+                operation.run, self.groups[operation.members][1]
+            )
+            return {
+                **operation_response(operation, self.rank, started),
+                "output_ids": outputs,
+                "finished": finished,
+            }
+        return self.execute(operation)
+
+    @torch.inference_mode()
+    def transfer(self, operation):
+        """One prefill owner's share of a finished prompt's KV to a decode instance.
+
+        The owner returns once its rows are sent and freed. Decode ranks return
+        as soon as the receive is posted on their transfer stream.
+        """
+        started = time.perf_counter()
+        if operation.local:
+            state = self.states.pop(operation.request_id)
+            self.decode.receive_local(operation, state.kv)
+            torch.cuda.current_stream(self.model.device).synchronize()
+            self.kv_pool.allocator.free(state.kv.indices)
+            return operation_response(operation, self.rank, started)
+        self._group(operation.members, operation.ticket)
+        communication = self.groups[operation.members][1]
+        if self.rank == operation.owner:
+            state = self.states.pop(operation.request_id)
+            if len(state.kv):
+                send_rows(
+                    state.kv,
+                    operation,
+                    communication,
+                    self.model.num_layers,
+                    self.model.num_kv_heads,
+                )
+            torch.cuda.current_stream(self.model.device).synchronize()
+            self.kv_pool.allocator.free(state.kv.indices)
+        else:
+            self.decode.receive(operation, communication)
+        return operation_response(operation, self.rank, started)
 
     @torch.inference_mode()
     def execute(self, operation):
@@ -250,7 +375,7 @@ class GroupWorker:
                 connection.close()
                 return
             elif message[0] == "reset":
-                if self.states:
+                if self.states or (self.decode is not None and self.decode.sequences):
                     raise RuntimeError("Request state leaked across benchmark phases")
                 self.kv_pool.assert_empty()
                 if self.model.device.type == "cuda":
@@ -259,7 +384,7 @@ class GroupWorker:
             elif message[0] == "execute":
                 operation = message[1]
                 try:
-                    result = self.execute(operation)
+                    result = self.run(operation)
                 except PlanRejected as exc:
                     if any(entry[-1]._failed for entry in self.groups.values()):
                         connection.send(
@@ -376,6 +501,9 @@ class AsyncExecutor:
         atol=1e-4,
         rtol=1e-4,
         timeout=600,
+        prewarm=(),
+        decode_instances=(),
+        decode_kv_tokens=0,
     ):
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
@@ -397,7 +525,10 @@ class AsyncExecutor:
             atol=atol,
             rtol=rtol,
             timeout=timeout,
+            decode_instances=decode_instances,
+            decode_kv_tokens=decode_kv_tokens,
         )
+        self.worker.prewarm(prewarm)
         self.connections = {}
         self.inflight = {}
         self.busy = set()
@@ -491,6 +622,9 @@ class AsyncExecutor:
             ):
                 raise RuntimeError("Invalid or duplicate operation acknowledgement")
             responses[rank] = message
+            # A member that answered is idle, e.g. a decode rank that posted a
+            # transfer receive while the prefill owner is still sending.
+            self.busy.discard(rank)
             if len(responses) == len(operation.members):
                 statuses = {m["status"] for m in responses.values()}
                 if len(statuses) != 1:
@@ -498,7 +632,6 @@ class AsyncExecutor:
                         "Group commit outcomes diverged; restart workers"
                     )
                 events.append((operation, list(responses.values())))
-                self.busy.difference_update(operation.members)
                 del self.inflight[operation.ticket]
         now = time.perf_counter()
         if any(now - start > self.timeout for _, start, _ in self.inflight.values()):

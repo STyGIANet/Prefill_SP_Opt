@@ -119,6 +119,37 @@ def main():
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--execution-mode", choices=("async", "sync"), default="async")
     parser.add_argument("--async-timeout", type=float, default=600)
+    parser.add_argument(
+        "--prewarm-groups",
+        choices=("none", "contiguous", "all"),
+        default="none",
+        help="Build these rank groups and connect their NCCL paths before measuring",
+    )
+    parser.add_argument(
+        "--decode-gpus",
+        type=int,
+        default=0,
+        help="Trailing workers that run TP1 decode replicas; the rest prefill",
+    )
+    parser.add_argument(
+        "--decode-tokens",
+        type=int,
+        default=128,
+        help="Output tokens per request, including the one sampled by prefill",
+    )
+    parser.add_argument("--decode-max-batch", type=int, default=128)
+    parser.add_argument(
+        "--decode-tp",
+        type=int,
+        default=0,
+        help="TP degree of each decode instance (default: one instance over all decode GPUs)",
+    )
+    parser.add_argument(
+        "--decode-kv-tokens",
+        type=int,
+        default=262144,
+        help="KV slots of each decode instance; every TP rank holds its KV-head slice",
+    )
     parser.add_argument("--warmup-requests", type=int, default=0)
     parser.add_argument("--warmup-tokens", type=int, default=8192)
     parser.add_argument(
@@ -149,7 +180,42 @@ def main():
     parser.add_argument(
         "--scheduler",
         default="greedy",
-        help="greedy, request, tetris, loongserve, or module:factory taking SchedulerConfig",
+        help="greedy, request, dynamic, tetris, loongserve, or module:factory taking SchedulerConfig",
+    )
+    # Tetris Implementation
+    parser.add_argument(
+        "--dynamic-profile",
+        help="Latency profile (Tetris profile JSON) for --scheduler dynamic predictions",
+    )
+    parser.add_argument(
+        "--step-seconds",
+        type=float,
+        help="Seconds per compute-bound step for --scheduler dynamic (default: from --dynamic-profile)",
+    )
+    parser.add_argument("--window-seconds", type=float, default=2.0)
+    parser.add_argument(
+        "--step-tokens",
+        type=int,
+        default=256,
+        help="Tokens one GPU prefills in one compute-bound step",
+    )
+    parser.add_argument(
+        "--long-steps",
+        type=int,
+        default=4,
+        help="Prompts taking more steps than this run one step at a time and are preemptible",
+    )
+    parser.add_argument(
+        "--resume-every-steps",
+        type=int,
+        default=2,
+        help="A preempted long prompt runs at least once every k steps",
+    )
+    parser.add_argument(
+        "--preempt-ratio",
+        type=float,
+        default=0.2,
+        help="Total preemption of a long prompt, as a fraction of its own duration",
     )
     parser.add_argument(
         "--sp-sizes",
@@ -176,6 +242,30 @@ def main():
         "--loongserve-profile", help="LoongServe batch latency SIB JSON"
     )
     parser.add_argument("--loongserve-max-prefill-seconds", type=float)
+    parser.add_argument(
+        "--loongserve-dp",
+        choices=("monotone", "exact"),
+        default="monotone",
+        help="Sec. 5.3 DP: Eq. (6) split monotonicity (paper) or exhaustive splits",
+    )
+    parser.add_argument(
+        "--loongserve-elastic-decode",
+        action="store_true",
+        help="Every worker also decodes; LoongServe preempts and places decoding (Sec. 5.1-5.4)",
+    )
+    parser.add_argument(
+        "--loongserve-decode-batch-limit",
+        type=int,
+        default=256,
+        help="Sec. 5.4 scale-up threshold: decode batch size where a step turns compute-bound "
+        "(measured roofline ridge, about 300 tokens on RTX PRO 6000 Blackwell)",
+    )
+    parser.add_argument(
+        "--loongserve-migration-bandwidth",
+        type=float,
+        default=25e9,
+        help="Bytes/s pricing Eq. (4) KV migration; assumed PCIe 5.0 x16 peer bandwidth",
+    )
     parser.add_argument("--max-running-requests", type=int, default=32)
     parser.add_argument("--max-batch-tokens", type=int, default=32768)
     parser.add_argument("--max-local-tokens", type=int, default=8192)
@@ -215,12 +305,41 @@ def main():
         parser.error(
             "Warmup requires async online execution; use --warmup-requests 0 otherwise"
         )
+    if args.prewarm_groups != "none" and args.execution_mode != "async":
+        parser.error("Group prewarm requires async execution")
+    if args.decode_gpus < 0 or args.decode_tokens < 2 or args.decode_max_batch <= 0:
+        parser.error("Need decode-gpus >= 0, decode-tokens >= 2, decode-max-batch > 0")
+    args.decode_tp = args.decode_tp or args.decode_gpus
+    if args.decode_gpus and (
+        args.decode_tp <= 0
+        or args.decode_gpus % args.decode_tp
+        or args.decode_kv_tokens <= 0
+    ):
+        parser.error(
+            "decode-tp must divide decode-gpus; decode-kv-tokens must be positive"
+        )
+    if args.loongserve_elastic_decode and (
+        args.scheduler != "loongserve" or args.decode_gpus
+    ):
+        parser.error(
+            "--loongserve-elastic-decode needs --scheduler loongserve and no decode GPUs"
+        )
+    if (args.decode_gpus or args.loongserve_elastic_decode) and (
+        args.execution_mode != "async" or args.schedule
+    ):
+        parser.error("Disaggregated decode requires async online execution")
     if args.chunk_size <= 0 or args.prompt_length <= 0:
         parser.error("prompt-length and chunk-size must be positive")
     if any(not math.isfinite(t) or t < 0 for t in (args.atol, args.rtol)):
         parser.error("tolerances must be finite and nonnegative")
     if args.scheduler == "tetris" and not args.tetris_profile and not args.schedule:
         parser.error("--scheduler tetris requires --tetris-profile")
+    if (
+        args.scheduler == "dynamic"
+        and not (args.dynamic_profile or args.step_seconds)
+        and not args.schedule
+    ):
+        parser.error("--scheduler dynamic requires --dynamic-profile or --step-seconds")
     if args.scheduler == "loongserve":
         if not args.loongserve_profile and not args.schedule:
             parser.error("--scheduler loongserve requires --loongserve-profile")
@@ -269,8 +388,10 @@ def main():
             migration_overlap=args.migration_overlap,
         )
 
+        # Profiles describe the prefill workers only; decode replicas follow them.
+        prefill_world = dist.get_world_size() - args.decode_gpus
         profile_gpu_names = (
-            engine._all_objects(torch.cuda.get_device_name(local_rank))
+            engine._all_objects(torch.cuda.get_device_name(local_rank))[:prefill_world]
             if args.scheduler in ("tetris", "loongserve") and args.device == "cuda"
             else None
         )
@@ -280,6 +401,7 @@ def main():
             hosts = engine._all_objects(socket.gethostname())
             unique_hosts = list(dict.fromkeys(hosts))
             profile_nodes = [unique_hosts.index(host) for host in hosts]
+            profile_nodes = profile_nodes[:prefill_world]
 
         def load_input():
             if dist.get_rank() != 0:
@@ -287,7 +409,7 @@ def main():
             if args.schedule:
                 return read_schedule(args.schedule), None, []
             config = SchedulerConfig(
-                dist.get_world_size(),
+                prefill_world,
                 args.max_local_tokens,
                 args.chunk_size,
                 args.max_running_requests,
@@ -299,6 +421,28 @@ def main():
                 from sglang.srt.dynamic_sp.dynamic_scheduler import RequestSpScheduler
 
                 policy = RequestSpScheduler(config, args.sp_sizes, args.size_thresholds)
+            elif args.scheduler == "dynamic":
+                from sglang.srt.dynamic_sp.dynamic_scheduler import (
+                    DynamicBatchScheduler,
+                )
+
+                options = {
+                    "window_seconds": args.window_seconds,
+                    "step_tokens": args.step_tokens,
+                    "long_steps": args.long_steps,
+                    "resume_every_steps": args.resume_every_steps,
+                    "preempt_ratio": args.preempt_ratio,
+                }
+                if args.step_seconds:
+                    policy = DynamicBatchScheduler(
+                        config, step_seconds=args.step_seconds, **options
+                    )
+                else:
+                    policy = DynamicBatchScheduler.from_profile(
+                        config,
+                        json.loads(Path(args.dynamic_profile).read_text()),
+                        **options,
+                    )
             elif args.scheduler in ("tetris", "loongserve"):
                 if args.scheduler == "tetris":
                     from sglang.srt.dynamic_sp.tetris import TetrisScheduler
@@ -313,6 +457,7 @@ def main():
                         config,
                         args.loongserve_profile,
                         args.loongserve_max_prefill_seconds,
+                        monotone=args.loongserve_dp == "monotone",
                     )
                 if policy.profile["nodes"] != profile_nodes:
                     raise ValueError(
@@ -323,7 +468,7 @@ def main():
                     ("model_path", os.path.realpath(args.model_path)),
                     ("execution_mode", args.execution_mode),
                     ("gpu_names", profile_gpu_names),
-                    ("world_size", dist.get_world_size()),
+                    ("world_size", config.world_size),
                     ("dtype", args.dtype),
                     ("attention_backend", args.attention_backend),
                     ("kv_transport", args.kv_transport),
@@ -551,7 +696,7 @@ def main():
                     "seconds": elapsed,
                     "scheduling_seconds": scheduling_seconds,
                     "tetris_decision": scheduler.policy.last_decision
-                    if scheduler is not None and args.scheduler == "tetris"
+                    if scheduler is not None and args.scheduler in ("tetris", "dynamic")
                     else None,
                     "new_tokens": new_tokens,
                     "tokens_per_second": new_tokens / elapsed if new_tokens else None,
@@ -641,7 +786,7 @@ def main():
                                 else "replay",
                                 "scheduler_settings": {
                                     "tetris": scheduler.policy.metadata()
-                                    if args.scheduler == "tetris"
+                                    if args.scheduler in ("tetris", "dynamic")
                                     else None,
                                     "chunk_tokens": args.chunk_size,
                                     "max_running_requests": args.max_running_requests,

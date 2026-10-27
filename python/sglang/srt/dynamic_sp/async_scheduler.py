@@ -161,6 +161,19 @@ class AsyncScheduler:
         self.version += 1
         return operations
 
+    def ticket(self):
+        """Ticket for an operation built outside the policy, e.g. KV handoff."""
+        self.next_ticket += 1
+        return self.next_ticket - 1
+
+    def hand_off(self, request_id):
+        """Forget a finished prompt whose KV left every prefill owner."""
+        request = self.requests[request_id]
+        if not request.complete or request_id in self.inflight:
+            raise ValueError("Only an idle, finished prompt can be handed off")
+        del self.requests[request_id]
+        self.version += 1
+
     def completed(self, operation, responses):
         ids = {s.request_id for s in operation.plan.steps} | set(operation.plan.release)
         if any(self.inflight.get(rid) != operation.ticket for rid in ids):

@@ -83,6 +83,12 @@ class GroupCommunication:
     def exchange(self, output, value, receive_counts, send_counts):
         self.data.alltoall_base(output, value, receive_counts, send_counts).wait()
 
+    def send(self, tensor, peer):
+        self.data.send([tensor], peer, 0).wait()
+
+    def recv(self, tensor, peer):
+        self.data.recv([tensor], peer, 0).wait()
+
     def gather(self, output, value):
         # Flattening also handles packed workspaces with arbitrary trailing dims.
         chunks = list(output.view(-1).split(value.numel()))

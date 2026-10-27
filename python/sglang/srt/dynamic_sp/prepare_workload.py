@@ -6,11 +6,13 @@ import argparse
 import hashlib
 import json
 import random
+from datetime import datetime
 from pathlib import Path
 
 from sglang.srt.dynamic_sp.arrivals import (
     poisson_arrival_times,
     request_rate_for_token_load,
+    trace_arrival_times,
 )
 from sglang.srt.dynamic_sp.llama import SUPPORTED_ARCHITECTURES
 
@@ -130,11 +132,20 @@ def main():
         "--offered-load",
         type=float,
         default=8192.0,
-        help="Expected offered input tokens per second (Poisson arrivals)",
+        help="Expected offered input tokens per second (Poisson or trace arrivals)",
     )
     parser.add_argument("--arrival-seed", type=int, default=0)
     parser.add_argument(
-        "--arrival-pattern", choices=("poisson", "burst"), default="poisson"
+        "--arrival-pattern",
+        choices=("poisson", "burst", "trace"),
+        default="poisson",
+        help="trace replays each record's --timestamp-column, time-compressed "
+        "so the mean input load equals --offered-load",
+    )
+    parser.add_argument(
+        "--timestamp-column",
+        default="timestamp",
+        help="ISO-8601 arrival time per record for --arrival-pattern trace",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-dir", required=True)
@@ -230,7 +241,7 @@ def main():
             streaming=True,
         )
         rows = enumerate(dataset)
-    prompts, source_rows, excluded_rows = [], [], []
+    prompts, source_rows, excluded_rows, timestamps = [], [], [], []
     bos = [tokenizer.bos_token_id] if tokenizer.bos_token_id is not None else []
     needed = args.input_tokens - len(bos) if args.input_tokens is not None else None
     if needed is not None and needed <= 0:
@@ -256,6 +267,10 @@ def main():
             )
             continue
         prompts.append(bos + tokens)
+        if args.arrival_pattern == "trace":
+            timestamps.append(
+                datetime.fromisoformat(row[args.timestamp_column]).timestamp()
+            )
         source_rows.append(
             {
                 "row_index": row_index,
@@ -271,11 +286,17 @@ def main():
         raise ValueError(f"Dataset yielded only {len(prompts)} eligible prompts")
     mean_prompt_tokens = sum(map(len, prompts)) / len(prompts)
     request_rate = request_rate_for_token_load(map(len, prompts), args.offered_load)
-    arrival_times = (
-        poisson_arrival_times(len(prompts), request_rate, args.arrival_seed)
-        if args.arrival_pattern == "poisson"
-        else [0.0] * len(prompts)
-    )
+    trace_scale = None
+    if args.arrival_pattern == "poisson":
+        arrival_times = poisson_arrival_times(
+            len(prompts), request_rate, args.arrival_seed
+        )
+    elif args.arrival_pattern == "trace":
+        arrival_times, trace_scale = trace_arrival_times(
+            timestamps, list(map(len, prompts)), args.offered_load
+        )
+    else:
+        arrival_times = [0.0] * len(prompts)
     workload = [
         {
             "request_id": f"prompt-{i}",
@@ -313,13 +334,19 @@ def main():
         "arrival_pattern": args.arrival_pattern,
         "mean_prompt_tokens": mean_prompt_tokens,
         "offered_load_input_tokens_per_second": args.offered_load
-        if args.arrival_pattern == "poisson"
+        if args.arrival_pattern != "burst"
         else None,
         "arrival_rate_prompts_per_second": request_rate
-        if args.arrival_pattern == "poisson"
+        if args.arrival_pattern != "burst"
         else None,
         "arrival_seed": args.arrival_seed,
-        "last_arrival_seconds": arrival_times[-1],
+        "timestamp_column": args.timestamp_column
+        if args.arrival_pattern == "trace"
+        else None,
+        # Replayed seconds per recorded second.
+        "trace_time_scale": trace_scale,
+        "trace_span_seconds": max(timestamps) - min(timestamps) if timestamps else None,
+        "last_arrival_seconds": max(arrival_times),
         "construction": (
             "One record per prompt; BOS per prompt; "
             + (
@@ -339,7 +366,7 @@ def main():
     load_description = (
         f"offered_input_tokens/s={args.offered_load:g} "
         f"derived_requests/s={request_rate:g}"
-        if args.arrival_pattern == "poisson"
+        if args.arrival_pattern != "burst"
         else "arrival_pattern=burst"
     )
     print(

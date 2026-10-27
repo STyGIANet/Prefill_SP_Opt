@@ -36,6 +36,22 @@ def request_rate_for_token_load(prompt_lengths, offered_tokens_per_second):
     return offered_tokens_per_second / (sum(lengths) / len(lengths))
 
 
+def trace_arrival_times(timestamps, prompt_lengths, offered_tokens_per_second):
+    """Offsets of real timestamps, time-compressed to the offered token load.
+
+    Gaps keep their recorded proportions; the span is set to total tokens over
+    the load, the expected span of Poisson arrivals at the same load. Offsets
+    follow the input order, which need not be sorted.
+    """
+    if not math.isfinite(offered_tokens_per_second) or offered_tokens_per_second <= 0:
+        raise ValueError("Offered token load must be finite and positive")
+    first, last = min(timestamps), max(timestamps)
+    if last <= first:
+        raise ValueError("Trace timestamps must span a positive interval")
+    scale = sum(prompt_lengths) / offered_tokens_per_second / (last - first)
+    return [(t - first) * scale for t in timestamps], scale
+
+
 class ArrivalSource:
     """Queue arrivals while workers execute; only rank zero owns this source.
 

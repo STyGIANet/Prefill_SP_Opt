@@ -12,8 +12,14 @@ from pathlib import Path
 
 import torch.distributed as dist
 from sglang.srt.dynamic_sp.arrivals import ArrivalSource
-from sglang.srt.dynamic_sp.async_executor import AsyncExecutor
+from sglang.srt.dynamic_sp.async_executor import AsyncExecutor, prewarm_memberships
 from sglang.srt.dynamic_sp.async_scheduler import AsyncScheduler
+from sglang.srt.dynamic_sp.decode import (
+    DecodeCoordinator,
+    DecodeStep,
+    KVTransfer,
+    decode_instances,
+)
 from sglang.srt.dynamic_sp.engine import PlanRejected
 from sglang.srt.dynamic_sp.metrics import throughput_summary
 from sglang.srt.dynamic_sp.scheduler import GreedyScheduler, SchedulerConfig
@@ -35,6 +41,18 @@ def run_async(args, model, control, scheduler, arrivals, plans):
         "shared_attention": args.shared_attention,
         "migration_overlap": getattr(args, "migration_overlap", True),
     }
+    prefill_world = dist.get_world_size() - args.decode_gpus
+    instances = _decode_instances(args)
+    prewarm = prewarm_memberships(prefill_world, args.prewarm_groups)
+    if prewarm:
+        # Decode TP groups, then every owner-to-instance transfer group.
+        extra = set(instances) | {
+            tuple(sorted({owner, *instance}))
+            for owner in range(prefill_world)
+            for instance in instances
+        }
+        prewarm += tuple(sorted(extra - set(prewarm), key=lambda g: (len(g), g)))
+    started = time.perf_counter()
     executor = AsyncExecutor(
         model,
         control,
@@ -43,10 +61,19 @@ def run_async(args, model, control, scheduler, arrivals, plans):
         atol=args.atol,
         rtol=args.rtol,
         timeout=args.async_timeout,
+        prewarm=prewarm,
+        decode_instances=instances,
+        decode_kv_tokens=args.decode_kv_tokens,
     )
     if dist.get_rank() != 0:
         executor.serve()
         return
+    if args.prewarm_groups != "none":
+        print(
+            f"[dynamic-sp] prewarmed {args.prewarm_groups} groups "
+            f"in {time.perf_counter() - started:.1f}s",
+            flush=True,
+        )
     warmup_count = getattr(args, "warmup_requests", 0)
     if warmup_count:
         from sglang.srt.dynamic_sp.benchmark import warmup_arrivals
@@ -85,7 +112,7 @@ def run_async(args, model, control, scheduler, arrivals, plans):
 
 def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=False):
     config = SchedulerConfig(
-        dist.get_world_size(),
+        dist.get_world_size() - args.decode_gpus,
         args.max_local_tokens,
         args.chunk_size,
         args.max_running_requests,
@@ -93,6 +120,32 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
     )
     policy = scheduler.policy if scheduler is not None else GreedyScheduler(config)
     driver = AsyncScheduler(policy, config, model)
+    decode = (
+        DecodeCoordinator(
+            _decode_instances(args),
+            args.decode_kv_tokens,
+            args.decode_tokens,
+            args.decode_max_batch,
+        )
+        if _decode_instances(args)
+        else None
+    )
+    # LoongServe elastic mode: its global manager also places decoding (Sec.
+    # 5.4) and plans prefill before decode steps claim the idle instances, so it
+    # can weigh preempting them (Sec. 5.1-5.2).
+    elastic = args.loongserve_elastic_decode
+    if elastic:
+        policy.attach_decode(
+            decode,
+            kv_bytes_per_token=2
+            * model.num_layers
+            * model.num_kv_heads
+            * model.head_dim
+            * model.dtype.itemsize,
+            bandwidth=args.loongserve_migration_bandwidth,
+            batch_limit=args.loongserve_decode_batch_limit,
+        )
+    records, decode_results = {}, []
     print(
         f"[dynamic-sp] execution=async workers={config.world_size} scheduler={args.scheduler} verify={args.verify}",
         flush=True,
@@ -119,6 +172,26 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
         while True:
             events = executor.poll(timeout=0)
             for operation, responses in events:
+                if isinstance(operation, (KVTransfer, DecodeStep)):
+                    _decode_completed(
+                        decode, driver, operation, responses, records, origin
+                    )
+                    decode_results.append(
+                        {
+                            "kind": type(operation).__name__,
+                            "ticket": operation.ticket,
+                            "members": operation.members,
+                            "requests": [operation.request_id]
+                            if isinstance(operation, KVTransfer)
+                            else list(operation.run),
+                            "worker_start_seconds": min(
+                                r["started_at"] for r in responses
+                            )
+                            - origin,
+                            "seconds": max(r["seconds"] for r in responses),
+                        }
+                    )
+                    continue
                 old_ends = {
                     prompt.request_id: end for prompt, _, end in operation.previous
                 }
@@ -151,6 +224,12 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
                     )
                     timing["output_ids"] = [token]
                     timings.append(timing)
+                    if decode is not None:
+                        request = driver.requests[rid]
+                        decode.add(
+                            rid, len(request.prompt.token_ids), request.ranks, token
+                        )
+                        records[rid] = timing
                 record = {
                     "ticket": operation.ticket,
                     "members": operation.members,
@@ -257,6 +336,9 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
                 )
                 last_reported_completed = len(timings)
                 next_progress = now + progress_interval
+            if decode is not None and not elastic:
+                for operation in decode.operations(executor.busy, driver.ticket):
+                    executor.submit(operation)
             scheduling_start = time.perf_counter()
             if plans is not None:
                 # Replay explicitly preserves plan boundaries. Independent
@@ -279,6 +361,12 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
                     plan = None
             else:
                 plan = driver.next_plan(now, executor.busy)
+            if plan is not None and decode is not None:
+                # A finished prompt stays on its prefill owners until its KV ships.
+                release = tuple(r for r in plan.release if not decode.holds(r))
+                plan = replace(plan, release=release)
+                if not plan.steps and not plan.release:
+                    plan = None
             if plan is not None:
                 operations = driver.operations(plan, now, executor.busy)
                 decision = {
@@ -296,11 +384,15 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
                         }
                     )
                     executor.submit(operation)
+            if decode is not None and elastic:
+                for operation in decode.operations(executor.busy, driver.ticket):
+                    executor.submit(operation)
+            if plan is not None:
                 continue
             exhausted = (
                 source.exhausted if source is not None else replay_index == len(plans)
             )
-            if exhausted and not executor.inflight:
+            if exhausted and not executor.inflight and (decode is None or decode.idle):
                 if source is not None and driver.requests:
                     raise RuntimeError(
                         "Async policy made no progress with pending requests and no leased workers"
@@ -380,6 +472,16 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
         ),
         "execution_seconds_definition": "Concurrent operation durations are not summed into a throughput denominator",
     }
+    if decode is not None:
+        summary.update(_decode_summary(timings, args))
+        print(
+            f"[dynamic-sp] decode gpus={args.decode_gpus} tp={args.decode_tp} tokens={args.decode_tokens} "
+            f"handoff_p50={summary['kv_handoff_p50_seconds']:.3f}s "
+            f"TPOT_p50={summary['tpot_p50_seconds'] * 1e3:.1f}ms "
+            f"TPOT_p95={summary['tpot_p95_seconds'] * 1e3:.1f}ms "
+            f"E2E_p50={summary['e2e_p50_seconds']:.3f}s",
+            flush=True,
+        )
     print(
         f"[dynamic-sp] execution=async prefill_tokens={summary['prefill_tokens']} "
         f"window_start={wall['throughput_start_seconds']}s "
@@ -412,9 +514,63 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
                     "request_timings": timings,
                     "executed_plans": executed,
                     "results": results,
+                    "decode_results": decode_results,
                     "summary": summary,
                 },
                 indent=2,
             )
             + "\n"
         )
+
+
+def _decode_completed(decode, driver, operation, responses, records, origin):
+    if responses[0]["status"] != "committed":
+        raise RuntimeError(f"Decode operation failed: {responses}")
+    ready = max(r["ready_at"] for r in responses) - origin
+    done = decode.completed(operation)
+    for rid in done["shipped"]:
+        driver.hand_off(rid)
+        records[rid]["kv_ready_time_seconds"] = ready
+    if isinstance(operation, DecodeStep):
+        leader = responses[0]
+        for rid, token in leader["output_ids"].items():
+            records[rid]["output_ids"].append(token)
+    for rid in done["finished"]:
+        timing = records.pop(rid)
+        timing["decode_done_time_seconds"] = ready
+        timing["kv_handoff_seconds"] = (
+            timing["kv_ready_time_seconds"] - timing["completion_time_seconds"]
+        )
+        timing["tpot_seconds"] = (ready - timing["kv_ready_time_seconds"]) / (
+            len(timing["output_ids"]) - 1
+        )
+        timing["e2e_seconds"] = ready - timing["arrival_time_seconds"]
+
+
+def _decode_summary(timings, args):
+    def percentiles(key):
+        values = sorted(t[key] for t in timings)
+        return values[len(values) // 2], values[math.ceil(0.95 * len(values)) - 1]
+
+    if any("e2e_seconds" not in t for t in timings):
+        raise RuntimeError("A request finished prefill but never finished decoding")
+    summary = {
+        "decode_gpus": args.decode_gpus,
+        "decode_tp": args.decode_tp,
+        "decode_tokens": args.decode_tokens,
+    }
+    for key in ("kv_handoff", "tpot", "e2e"):
+        summary[f"{key}_p50_seconds"], summary[f"{key}_p95_seconds"] = percentiles(
+            f"{key}_seconds"
+        )
+    return summary
+
+
+def _decode_instances(args):
+    world = dist.get_world_size()
+    if args.loongserve_elastic_decode:
+        # LoongServe: every elastic instance also decodes, one TP1 replica each.
+        return tuple((rank,) for rank in range(world))
+    if not args.decode_gpus:
+        return ()
+    return decode_instances(world - args.decode_gpus, world, args.decode_tp)
