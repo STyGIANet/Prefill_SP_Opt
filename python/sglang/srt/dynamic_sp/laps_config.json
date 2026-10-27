@@ -1,0 +1,8 @@
+{
+  "instance_degree": 1,
+  "length_threshold": 256,
+  "long_chunk_tokens": 8192,
+  "short_token_budget": 16384,
+  "wait_max_seconds": 0.005,
+  "deadline_seconds": null
+}

@@ -194,7 +194,12 @@ class NativeKVStorage:
         return SlotKV(self, indices, id(previous) if previous is not None else None)
 
     def commit(self, old, new):
+        retained_prefixes = {
+            state.kv.prefix_id for state in new.values() if isinstance(state.kv, SlotKV)
+        }
         for rid, state in old.items():
+            if id(state.kv) in retained_prefixes:
+                continue
             replacement = new.get(rid)
             if replacement is not None and (
                 replacement.kv is state.kv or replacement.kv.prefix_id == id(state.kv)

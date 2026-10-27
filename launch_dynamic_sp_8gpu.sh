@@ -47,6 +47,7 @@ verbose=0
 verify_flag="--no-verify"
 prepare_args=()
 runner_args=()
+laps_config=""
 loongserve_calibration_grid="lean"
 loongserve_calibration_concurrency="parallel"
 loongserve_profile=""
@@ -106,7 +107,9 @@ Options:
   --arrival-seed N      Reproducible arrival RNG seed (default: 0)
   --arrival-pattern P   poisson (default) or burst for saturation tests
   --execution-mode MODE async (default) or sync SP execution
-  --scheduler NAME      all SP schedulers (default), greedy, request, tetris, loongserve, or module:factory
+  --max-prompt-tokens N Exclude longer records without truncation
+  --laps-config PATH   LAPS scheduling and graph configuration JSON
+  --scheduler NAME      all SP schedulers (default), greedy, request, tetris, loongserve, laps, or module:factory
   --sp-sizes LIST        Request scheduler block sizes, e.g. 1,2,4,8
   --size-thresholds LIST Request scheduler length thresholds, e.g. 256,1024,4096
   --recalibrate-loongserve  Explicitly run new GPU calibration (default: reuse compatible profile)
@@ -179,11 +182,12 @@ while (($#)); do
         --eval-length-mode) set -- --length-mode "${@:2}" ;;
     esac
     case "$1" in
-        --loongserve-calibration-concurrency|--loongserve-calibration-grid|--loongserve-profile|--loongserve-samples|--loongserve-max-prefill-seconds|--loongserve-calibration-lengths|--progress-interval|--datasets|--attention-backends|--kv-transports|--repeats|--warmup-tokens|--warmup-requests|--tetris-fit-method|--execution-mode|--workload-dir|--python|--model|--dataset|--dataset-config|--split|--num-prompts|--input-tokens|--chunk-tokens|--max-local-tokens|--output-dir|--model-revision|--dataset-revision|--text-column|--seed|--dtype|--attention-backend|--scheduler|--max-running-requests|--max-batch-tokens|--offered-load|--arrival-seed|--arrival-pattern|--length-mode|--tetris-profile|--fit-dataset|--fit-split|--fit-dataset-config|--fit-dataset-revision|--fit-text-column|--fit-num-prompts|--fit-input-tokens|--fit-length-mode|--tetris-samples|--tetris-loads|--tetris-request-rates|--tetris-min-chunk-tokens|--tetris-chunk-solver|--tetris-objective|--tetris-simulation-requests|--kv-transport|--shared-attention|--sp-sizes|--size-thresholds)
+        --max-prompt-tokens|--laps-config|--loongserve-calibration-concurrency|--loongserve-calibration-grid|--loongserve-profile|--loongserve-samples|--loongserve-max-prefill-seconds|--loongserve-calibration-lengths|--progress-interval|--datasets|--attention-backends|--kv-transports|--repeats|--warmup-tokens|--warmup-requests|--tetris-fit-method|--execution-mode|--workload-dir|--python|--model|--dataset|--dataset-config|--split|--num-prompts|--input-tokens|--chunk-tokens|--max-local-tokens|--output-dir|--model-revision|--dataset-revision|--text-column|--seed|--dtype|--attention-backend|--scheduler|--max-running-requests|--max-batch-tokens|--offered-load|--arrival-seed|--arrival-pattern|--length-mode|--tetris-profile|--fit-dataset|--fit-split|--fit-dataset-config|--fit-dataset-revision|--fit-text-column|--fit-num-prompts|--fit-input-tokens|--fit-length-mode|--tetris-samples|--tetris-loads|--tetris-request-rates|--tetris-min-chunk-tokens|--tetris-chunk-solver|--tetris-objective|--tetris-simulation-requests|--kv-transport|--shared-attention|--sp-sizes|--size-thresholds)
             if (($# < 2)) || [[ -z "$2" || "$2" == --* ]]; then
                 printf 'Missing value for %s\n' "$1" >&2; exit 2
             fi
             case "$1" in
+                --laps-config) laps_config="$2"; runner_args+=("$1" "$2") ;;
                 --loongserve-calibration-concurrency) loongserve_calibration_concurrency="$2" ;;
                 --loongserve-calibration-grid) loongserve_calibration_grid="$2" ;;
                 --loongserve-profile) loongserve_profile="$2" ;;
@@ -334,6 +338,10 @@ for path in "$tetris_profile" "$tetris_samples" "$loongserve_profile" "$loongser
         printf 'Cannot read scheduler profile/samples: %s\n' "$path" >&2; exit 2
     fi
 done
+if [[ "$scheduler" == laps ]]; then
+    laps_capacity="$("$python_bin" -c 'import sys; from sglang.srt.dynamic_sp.laps import LAPSConfig; print(LAPSConfig.read(sys.argv[1] or None).instance_degree * int(sys.argv[2]))' "$laps_config" "$max_local_tokens")"
+    prepare_args+=(--max-prompt-tokens "$laps_capacity")
+fi
 if [[ -n "$workload_dir" ]]; then
     for name in workload.json manifest.json; do
         if [[ ! -r "$workload_dir/$name" ]]; then

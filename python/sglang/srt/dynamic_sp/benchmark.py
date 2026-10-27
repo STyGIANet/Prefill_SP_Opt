@@ -39,10 +39,14 @@ FIELDS = [
     "completed_prompts",
     "input_tokens",
     "excluded_context_records",
+    "excluded_capacity_records",
     "window_seconds",
     "throughput_tokens_per_second",
     "ttft_p50_seconds",
     "ttft_p95_seconds",
+    "slo_requests",
+    "slo_violations",
+    "prefill_graph_replays",
     "warmup_requests",
     "allocator_retries",
     "peak_allocated_bytes",
@@ -98,7 +102,11 @@ def measured_metrics(result, workload):
     latencies = []
     for r in records:
         original = expected[r["request_id"]]
-        if r["input_tokens"] != len(original["token_ids"]) or not math.isclose(
+        parent = expected.get(original.get("prefix_request_id"))
+        new_tokens = len(original["token_ids"]) - (
+            len(parent["token_ids"]) if parent else 0
+        )
+        if r["input_tokens"] != new_tokens or not math.isclose(
             r["arrival_time_seconds"],
             original.get("arrival_time_seconds", 0),
             abs_tol=1e-6,
@@ -113,6 +121,9 @@ def measured_metrics(result, workload):
     wall = throughput_summary(records)
     latencies.sort()
     return {
+        "slo_requests": result["summary"].get("slo_requests", 0),
+        "slo_violations": result["summary"].get("slo_violations", 0),
+        "prefill_graph_replays": result["summary"].get("prefill_graph_replays", 0),
         "completed_prompts": len(records),
         "input_tokens": wall["completed_input_tokens"],
         "window_seconds": wall["prefill_wall_seconds"],
@@ -146,6 +157,7 @@ def main():
     parser.add_argument("--text-column", "--eval-text-column", default="text")
     parser.add_argument("--split", "--eval-split", default="test")
     parser.add_argument("--scheduler", default="all")
+    parser.add_argument("--laps-config")
     parser.add_argument("--attention-backends")
     parser.add_argument("--attention-backend")
     parser.add_argument("--kv-transports")
@@ -266,6 +278,18 @@ def main():
             "--output-dir",
             str(prepared),
         ]
+        if "laps" in schedulers:
+            from sglang.srt.dynamic_sp.laps import LAPSConfig
+
+            capacity = (
+                int(common[common.index("--max-local-tokens") + 1])
+                if "--max-local-tokens" in common
+                else 131072
+            )
+            limit = LAPSConfig.read(args.laps_config).instance_degree * capacity
+            if "--max-prompt-tokens" in common:
+                limit = min(limit, int(common[common.index("--max-prompt-tokens") + 1]))
+            flags += ["--max-prompt-tokens", str(limit)]
         if args.workload_dir:
             flags += ["--workload-dir", args.workload_dir]
         code = run(flags, directory / "prepare.log")
@@ -318,6 +342,9 @@ def main():
                     "excluded_context_records": manifest.get(
                         "excluded_context_records", ""
                     ),
+                    "excluded_capacity_records": manifest.get(
+                        "excluded_capacity_records", 0
+                    ),
                     "result_path": str(target / "results.json"),
                 }
                 try:
@@ -337,6 +364,8 @@ def main():
                         "--output-dir",
                         str(target),
                     ]
+                    if scheduler == "laps" and args.laps_config:
+                        flags += ["--laps-config", args.laps_config]
                     if scheduler == "loongserve":
                         profile = (
                             Path(args.loongserve_profile).resolve()

@@ -226,11 +226,14 @@ class DynamicSPPrefillEngine:
                 return fn()
             except BaseException as exc:
                 self._failed = True
-                raise RuntimeError(f"Fatal prefill phase {label} on rank {self.rank}") from exc
+                raise RuntimeError(
+                    f"Fatal prefill phase {label} on rank {self.rank}"
+                ) from exc
             finally:
                 self.metrics["local_work_and_device_wait_seconds"] = (
                     self.metrics.get("local_work_and_device_wait_seconds", 0.0)
-                    + time.perf_counter() - started
+                    + time.perf_counter()
+                    - started
                 )
                 self.metrics["local_checked_phases"] = (
                     self.metrics.get("local_checked_phases", 0) + 1
@@ -334,6 +337,25 @@ class DynamicSPPrefillEngine:
                 for t in p.token_ids
             ):
                 raise ValueError("Prompt token ID outside model vocabulary")
+            if p.prefix_request_id is not None:
+                parent = self._states.get(p.prefix_request_id)
+                if parent is None or p.prefix_request_id not in released:
+                    raise ValueError(
+                        "Prefix admission must atomically release its resident parent"
+                    )
+                if (
+                    parent.end != len(parent.prompt.token_ids)
+                    or p.prefix_length != parent.end
+                    or p.token_ids[: parent.end] != parent.prompt.token_ids
+                ):
+                    raise ValueError(
+                        "Prefix admission does not match complete parent KV"
+                    )
+                if (
+                    sum(q.prefix_request_id == p.prefix_request_id for q in plan.admit)
+                    != 1
+                ):
+                    raise ValueError("A retained prefix can transfer to only one child")
             prompts[p.request_id] = p
         layouts = {
             rid: (s.ranks, s.end)
@@ -344,7 +366,9 @@ class DynamicSPPrefillEngine:
             if step.request_id not in prompts:
                 raise ValueError(f"Unknown request {step.request_id!r}")
             validate_ranks(step.ranks, self.world_size)
-            start = layouts.get(step.request_id, ((), 0))[1]
+            start = layouts.get(
+                step.request_id, ((), prompts[step.request_id].prefix_length)
+            )[1]
             if type(step.end) is not int or not start <= step.end <= len(
                 prompts[step.request_id].token_ids
             ):
@@ -448,7 +472,9 @@ class DynamicSPPrefillEngine:
             )
             migrated = self._redistribute_batch(plan.steps, prompts, deferred=deferred)
             for step, state in zip(plan.steps, migrated):
-                previous = self._states.get(step.request_id)
+                previous = self._states.get(step.request_id) or self._states.get(
+                    prompts[step.request_id].prefix_request_id
+                )
                 start = previous.end if previous is not None else 0
                 if step.end > start:
                     forwards.append((state, start))
@@ -466,6 +492,9 @@ class DynamicSPPrefillEngine:
             # synchronize hosts at each projection, attention and MLP phase.
             self._local_checks_only = self.communication is not None
             try:
+                self._graph_requested = bool(plan.steps) and all(
+                    s.use_graph for s in plan.steps
+                )
                 outputs = self._prefill_batch(forwards) if forwards else {}
             finally:
                 self._local_checks_only = False
@@ -530,7 +559,9 @@ class DynamicSPPrefillEngine:
             tail = (m.num_layers, 2, m.num_kv_heads, m.head_dim)
             for step in steps:
                 shape = (len(local_positions(step.end, step.ranks, self.rank)), *tail)
-                previous = self._states.get(step.request_id)
+                previous = self._states.get(step.request_id) or self._states.get(
+                    prompts[step.request_id].prefix_request_id
+                )
                 reusable = (
                     previous.kv
                     if previous is not None
@@ -545,7 +576,9 @@ class DynamicSPPrefillEngine:
                 )
                 state = _State(prompts[step.request_id], step.ranks, step.end, kv)
                 states.append(state)
-                previous = self._states.get(step.request_id)
+                previous = self._states.get(step.request_id) or self._states.get(
+                    prompts[step.request_id].prefix_request_id
+                )
                 if previous is None or previous.end == 0:
                     continue
                 if previous.ranks == step.ranks:
@@ -652,6 +685,22 @@ class DynamicSPPrefillEngine:
         return states
 
     def _prefill_batch(self, forwards):
+        graph = getattr(self, "prefill_graph", None)
+        if (
+            graph is not None
+            and getattr(self, "_graph_requested", False)
+            and graph.shape(forwards) is not None
+        ):
+            if self._migration is not None:
+                self._migration.wait(0)
+                for layer in range(1, self.model.num_layers):
+                    self._migration.launch(layer)
+                    self._migration.wait(layer)
+                self._migration.drain()
+                self._migration = None
+            outputs = graph.run(forwards, self.logits_mode)
+            self.metrics["prefill_graph_replays"] = 1
+            return outputs
         m = self.model
         layouts = []
         all_positions, all_ids = [], []

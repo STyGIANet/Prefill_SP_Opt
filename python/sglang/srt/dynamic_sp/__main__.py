@@ -96,7 +96,12 @@ def read_schedule(path):
         PrefillPlan(
             version=p.get("version", i),
             steps=tuple(
-                PromptStep(s["request_id"], tuple(s["ranks"]), s["end"])
+                PromptStep(
+                    s["request_id"],
+                    tuple(s["ranks"]),
+                    s["end"],
+                    s.get("use_graph", False),
+                )
                 for s in p.get("steps", [])
             ),
             admit=tuple(
@@ -180,7 +185,7 @@ def main():
     parser.add_argument(
         "--scheduler",
         default="greedy",
-        help="greedy, request, dynamic, tetris, loongserve, or module:factory taking SchedulerConfig",
+        help="greedy, request, dynamic, tetris, loongserve, laps, or module:factory taking SchedulerConfig",
     )
     # Tetris Implementation
     parser.add_argument(
@@ -289,7 +294,16 @@ def main():
     parser.add_argument(
         "--output", help="Save JSON validation/timing results on worker zero"
     )
+    parser.add_argument(
+        "--laps-config", help="LAPS scheduling and graph configuration JSON"
+    )
     args = parser.parse_args()
+    if args.scheduler == "laps" and (
+        args.execution_mode != "async"
+        or args.decode_gpus
+        or args.loongserve_elastic_decode
+    ):
+        parser.error("LAPS uses async prefill-only execution")
     if any(
         not math.isfinite(v) or v < 0
         for v in (args.progress_interval, args.progress_throughput_target)
@@ -417,6 +431,10 @@ def main():
             )
             if args.scheduler == "greedy":
                 policy = GreedyScheduler(config)
+            elif args.scheduler == "laps":
+                from sglang.srt.dynamic_sp.laps import LAPSScheduler, LAPSConfig
+
+                policy = LAPSScheduler(config, LAPSConfig.read(args.laps_config))
             elif args.scheduler == "request":
                 from sglang.srt.dynamic_sp.dynamic_scheduler import RequestSpScheduler
 
@@ -502,8 +520,43 @@ def main():
                 ]
             )
             arrivals, seen = [], set()
+            workload_prompts = {}
             for row in raw:
-                prompt = Prompt(row["request_id"], tuple(row["token_ids"]))
+                parent_id = row.get("prefix_request_id")
+                parent = (
+                    workload_prompts.get(parent_id) if parent_id is not None else None
+                )
+                if parent_id is not None and (
+                    args.scheduler != "laps" or parent is None or not parent.retain_kv
+                ):
+                    raise ValueError(
+                        "A LAPS prefix must reference an earlier retain_kv workload record"
+                    )
+                prompt = Prompt(
+                    row["request_id"],
+                    tuple(row["token_ids"]),
+                    row.get("ttft_slo_seconds"),
+                    parent_id,
+                    len(parent.token_ids) if parent is not None else 0,
+                    bool(row.get("retain_kv", False)),
+                )
+                if parent is not None and (
+                    len(prompt.token_ids) <= prompt.prefix_length
+                    or prompt.token_ids[: prompt.prefix_length] != parent.token_ids
+                ):
+                    raise ValueError(
+                        "Continuation token_ids must strictly extend the retained parent"
+                    )
+                if parent_id is not None and any(
+                    p.prefix_request_id == parent_id for p in workload_prompts.values()
+                ):
+                    raise ValueError("Branching prefix chains are not supported")
+                workload_prompts[prompt.request_id] = prompt
+                if prompt.ttft_slo_seconds is not None and (
+                    not math.isfinite(prompt.ttft_slo_seconds)
+                    or prompt.ttft_slo_seconds <= 0
+                ):
+                    raise ValueError("ttft_slo_seconds must be finite and positive")
                 arrival = float(row.get("arrival_time_seconds", 0.0))
                 if not math.isfinite(arrival) or arrival < 0:
                     raise ValueError("Arrival times must be finite and nonnegative")
@@ -511,6 +564,14 @@ def main():
                     raise ValueError("Workload request IDs must be unique and nonempty")
                 if not prompt.token_ids or len(prompt.token_ids) > model.context_length:
                     raise ValueError("Prompt length is outside model context")
+                if (
+                    args.scheduler == "laps"
+                    and len(prompt.token_ids)
+                    > policy.options.instance_degree * config.max_local_tokens
+                ):
+                    raise ValueError(
+                        "LAPS workload exceeds fixed instance capacity; prepare with --max-prompt-tokens or increase instance_degree"
+                    )
                 if len(prompt.token_ids) > config.world_size * config.max_local_tokens:
                     raise ValueError("Prompt exceeds aggregate KV capacity")
                 if any(
