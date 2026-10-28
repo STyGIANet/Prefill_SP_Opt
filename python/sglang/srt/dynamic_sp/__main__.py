@@ -96,7 +96,11 @@ def read_schedule(path):
         PrefillPlan(
             version=p.get("version", i),
             steps=tuple(
-                PromptStep(s["request_id"], tuple(s["ranks"]), s["end"])
+                PromptStep(
+                    s["request_id"],
+                    tuple(s["ranks"]),
+                    s["end"],
+                )
                 for s in p.get("steps", [])
             ),
             admit=tuple(
@@ -285,6 +289,10 @@ def main():
         "--output", help="Save JSON validation/timing results on worker zero"
     )
     args = parser.parse_args()
+    if args.scheduler == "laps":
+        parser.error(
+            "LAPS uses the native runtime. Launch with ./launch_dynamic_sp_8gpu.sh --scheduler laps"
+        )
     if any(
         not math.isfinite(v) or v < 0
         for v in (args.progress_interval, args.progress_throughput_target)
@@ -488,8 +496,41 @@ def main():
                 ]
             )
             arrivals, seen = [], set()
+            workload_prompts = {}
             for row in raw:
-                prompt = Prompt(row["request_id"], tuple(row["token_ids"]))
+                parent_id = row.get("prefix_request_id")
+                parent = (
+                    workload_prompts.get(parent_id) if parent_id is not None else None
+                )
+                if parent_id is not None:
+                    raise ValueError(
+                        "Retained-prefix workload chains are not supported by the selected scheduler"
+                    )
+                prompt = Prompt(
+                    row["request_id"],
+                    tuple(row["token_ids"]),
+                    row.get("ttft_slo_seconds"),
+                    parent_id,
+                    len(parent.token_ids) if parent is not None else 0,
+                    bool(row.get("retain_kv", False)),
+                )
+                if parent is not None and (
+                    len(prompt.token_ids) <= prompt.prefix_length
+                    or prompt.token_ids[: prompt.prefix_length] != parent.token_ids
+                ):
+                    raise ValueError(
+                        "Continuation token_ids must strictly extend the retained parent"
+                    )
+                if parent_id is not None and any(
+                    p.prefix_request_id == parent_id for p in workload_prompts.values()
+                ):
+                    raise ValueError("Branching prefix chains are not supported")
+                workload_prompts[prompt.request_id] = prompt
+                if prompt.ttft_slo_seconds is not None and (
+                    not math.isfinite(prompt.ttft_slo_seconds)
+                    or prompt.ttft_slo_seconds <= 0
+                ):
+                    raise ValueError("ttft_slo_seconds must be finite and positive")
                 arrival = float(row.get("arrival_time_seconds", 0.0))
                 if not math.isfinite(arrival) or arrival < 0:
                     raise ValueError("Arrival times must be finite and nonnegative")

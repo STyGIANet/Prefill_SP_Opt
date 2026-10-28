@@ -223,6 +223,11 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
                         timing["response_observed_time_seconds"]
                         - timing["completion_time_seconds"]
                     )
+                    timing["slo_violated"] = (
+                        (timing["ttft_seconds"] > timing["ttft_slo_seconds"])
+                        if timing.get("ttft_slo_seconds") is not None
+                        else None
+                    )
                     timing["output_ids"] = [token]
                     timings.append(timing)
                     if decode is not None:
@@ -235,7 +240,11 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
                     "ticket": operation.ticket,
                     "members": operation.members,
                     "new_tokens": sum(
-                        s.end - old_ends.get(s.request_id, 0)
+                        s.end
+                        - old_ends.get(
+                            s.request_id,
+                            driver.requests[s.request_id].prompt.prefix_length,
+                        )
                         for s in operation.plan.steps
                     ),
                     "worker_start_seconds": min(r["started_at"] for r in responses)
@@ -259,7 +268,8 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
                     driver.submit(prompt, timestamp)
                     pending[prompt.request_id] = {
                         "request_id": prompt.request_id,
-                        "input_tokens": len(prompt.token_ids),
+                        "input_tokens": len(prompt.token_ids) - prompt.prefix_length,
+                        "ttft_slo_seconds": prompt.ttft_slo_seconds,
                         "arrival_time_seconds": timestamp - origin,
                         "submission_time_seconds": timestamp + delay - origin,
                     }
@@ -352,7 +362,8 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
                         driver.submit(prompt, now)
                         pending[prompt.request_id] = {
                             "request_id": prompt.request_id,
-                            "input_tokens": len(prompt.token_ids),
+                            "input_tokens": len(prompt.token_ids)
+                            - prompt.prefix_length,
                             "arrival_time_seconds": now - origin,
                             "submission_time_seconds": now - origin,
                         }
@@ -361,6 +372,8 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
                 else:
                     plan = None
             else:
+                if hasattr(policy, "arrivals_exhausted"):
+                    policy.arrivals_exhausted = source.exhausted
                 plan = driver.next_plan(now, executor.busy)
             if plan is not None and decode is not None:
                 # A finished prompt stays on its prefill owners until its KV ships.
@@ -400,7 +413,12 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
                 # next boundary, so only a stall longer than the timeout is an error.
                 if stalled_since is None:
                     stalled_since = now
-                elif now - stalled_since > args.async_timeout:
+                elif now - stalled_since > args.async_timeout or driver.requests and getattr(policy, "wake_at", None) is not None:
+                    time.sleep(
+                        min(0.001, max(0.0, policy.wake_at - time.perf_counter()))
+                    )
+                    continue
+                if source is not None and driver.requests:
                     raise RuntimeError(
                         "Async policy made no progress with pending requests and no leased workers"
                     )
@@ -467,6 +485,13 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
                 for m in r["worker_metrics"]
             ),
             default=0,
+        ),
+        "slo_requests": sum(t.get("slo_violated") is not None for t in timings),
+        "slo_violations": sum(t.get("slo_violated") is True for t in timings),
+        "prefill_graph_replays": sum(
+            m.get("prefill_graph_replays", 0)
+            for r in results
+            for m in r["worker_metrics"]
         ),
         "kv_storage": "native_sglang_slot_pool",
         "verification_enabled": args.verify,

@@ -60,6 +60,10 @@ class Schedule(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    prefill_decode_interval_min_bs: A[
+        int,
+        "Apply --prefill-decode-interval only while the running batch holds at least this many requests. Below it, prefill is admitted every round so the batch fills quickly. In data-parallel attention mode, each rank compares its own running batch. Set to 0 to always apply the interval.",
+    ] = 0
     enable_dynamic_chunking: A[
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
@@ -79,6 +83,11 @@ class Schedule(msgspec.Struct):
         Optional[int],
         "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
     ] = None
+    laps_graph_config: A[str, "Released LAPS graph configuration as JSON."] = ""
+    enable_laps_scheduler: A[
+        bool, "Use the released LAPS short-first prefill queues."
+    ] = False
+    laps_length_threshold: A[int, "LAPS short-request input length threshold."] = 256
     schedule_policy: A[
         str,
         Arg(

@@ -14,6 +14,10 @@ from dataclasses import dataclass
 class Prompt:
     request_id: str
     token_ids: tuple[int, ...]
+    ttft_slo_seconds: float | None = None
+    prefix_request_id: str | None = None
+    prefix_length: int = 0
+    retain_kv: bool = False
 
 
 @dataclass(frozen=True)

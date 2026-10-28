@@ -39,10 +39,14 @@ FIELDS = [
     "completed_prompts",
     "input_tokens",
     "excluded_context_records",
+    "excluded_capacity_records",
     "window_seconds",
     "throughput_tokens_per_second",
     "ttft_p50_seconds",
     "ttft_p95_seconds",
+    "slo_requests",
+    "slo_violations",
+    "prefill_graph_replays",
     "warmup_requests",
     "allocator_retries",
     "peak_allocated_bytes",
@@ -98,7 +102,11 @@ def measured_metrics(result, workload):
     latencies = []
     for r in records:
         original = expected[r["request_id"]]
-        if r["input_tokens"] != len(original["token_ids"]) or not math.isclose(
+        parent = expected.get(original.get("prefix_request_id"))
+        new_tokens = len(original["token_ids"]) - (
+            len(parent["token_ids"]) if parent else 0
+        )
+        if r["input_tokens"] != new_tokens or not math.isclose(
             r["arrival_time_seconds"],
             original.get("arrival_time_seconds", 0),
             abs_tol=1e-6,
@@ -113,6 +121,9 @@ def measured_metrics(result, workload):
     wall = throughput_summary(records)
     latencies.sort()
     return {
+        "slo_requests": result["summary"].get("slo_requests", 0),
+        "slo_violations": result["summary"].get("slo_violations", 0),
+        "prefill_graph_replays": result["summary"].get("prefill_graph_replays", 0),
         "completed_prompts": len(records),
         "input_tokens": wall["completed_input_tokens"],
         "window_seconds": wall["prefill_wall_seconds"],
@@ -146,6 +157,7 @@ def main():
     parser.add_argument("--text-column", "--eval-text-column", default="text")
     parser.add_argument("--split", "--eval-split", default="test")
     parser.add_argument("--scheduler", default="all")
+    parser.add_argument("--laps-config")
     parser.add_argument("--attention-backends")
     parser.add_argument("--attention-backend")
     parser.add_argument("--kv-transports")
@@ -185,6 +197,15 @@ def main():
     )
     if "sglang-dp" in schedulers:
         parser.error("This benchmark compares SP schedulers only")
+    if args.scheduler == "laps" and (
+        args.attention_backends
+        or args.attention_backend
+        or args.kv_transports
+        or args.kv_transport
+    ):
+        parser.error(
+            "LAPS uses native attention. Configure it with --laps-config; SP backend/transport sweeps do not apply."
+        )
     backends = (
         args.attention_backends or args.attention_backend or "ring gathered streaming"
     ).split()
@@ -246,7 +267,11 @@ def main():
                 proc.wait()
                 raise
 
-    combinations = list(itertools.product(schedulers, backends, transports))
+    combinations = (
+        [("laps", "native", "none")]
+        if args.scheduler == "laps"
+        else list(itertools.product(schedulers, backends, transports))
+    )
     for name, dataset, config, column in datasets:
         directory = output / name
         directory.mkdir()
@@ -318,6 +343,9 @@ def main():
                     "excluded_context_records": manifest.get(
                         "excluded_context_records", ""
                     ),
+                    "excluded_capacity_records": manifest.get(
+                        "excluded_capacity_records", 0
+                    ),
                     "result_path": str(target / "results.json"),
                 }
                 try:
@@ -337,6 +365,17 @@ def main():
                         "--output-dir",
                         str(target),
                     ]
+                    if scheduler == "laps":
+                        flags = [
+                            "--scheduler",
+                            scheduler,
+                            "--workload-dir",
+                            str(prepared),
+                            "--output-dir",
+                            str(target),
+                        ]
+                        if args.laps_config:
+                            flags += ["--laps-config", args.laps_config]
                     if scheduler == "loongserve":
                         profile = (
                             Path(args.loongserve_profile).resolve()
@@ -413,8 +452,22 @@ def main():
                             f"Trial exited {status}; see {target / 'benchmark.log'}"
                         )
                     result = json.loads((target / "results.json").read_text())
+                    measured_workload = workload
+                    if scheduler == "laps":
+                        capacity = result["capacity_filter"]
+                        measured_workload = json.loads(
+                            Path(capacity["evaluated_workload"]).read_text()
+                        )
+                        row.update(
+                            workload_sha256=capacity["evaluated_workload_sha256"],
+                            excluded_capacity_records=capacity["excluded_prompts"],
+                            attention_backend=result["engine_settings"][
+                                "attention_backend"
+                            ],
+                            effective_attention_transport="native_dp",
+                        )
                     row.update(
-                        measured_metrics(result, workload),
+                        measured_metrics(result, measured_workload),
                         status="ok",
                         dtype=result.get("dtype", ""),
                     )

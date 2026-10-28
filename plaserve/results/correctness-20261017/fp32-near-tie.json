@@ -1,0 +1,58 @@
+[
+  {
+    "case": "cold-1",
+    "row": 0,
+    "step": 0,
+    "input_ids": [
+      1016,
+      3993,
+      4988,
+      3773,
+      1973,
+      8263,
+      3041,
+      8490,
+      4376,
+      6712,
+      3353,
+      3946,
+      4851,
+      3114,
+      4905,
+      5704
+    ],
+    "agreed_prefix": [],
+    "sources": [
+      {
+        "output": "/home/apal/prefill-optimization/PLAserve/results/pd-fp32-20261017-174407/normalized",
+        "count": 1,
+        "baseline_mode": "single"
+      },
+      {
+        "output": "/home/apal/prefill-optimization/PLAserve/results/pd-fp32-20261017-174407/normalized",
+        "count": 8,
+        "baseline_mode": "single"
+      }
+    ],
+    "argmax": 6,
+    "top_ids": [
+      6,
+      4030,
+      220,
+      82,
+      3538
+    ],
+    "top_logits": [
+      9.687469482421875,
+      9.58212947845459,
+      9.533604621887207,
+      9.445721626281738,
+      9.080202102661133
+    ],
+    "single_token": 6,
+    "pd_token": 4030,
+    "single_logit": 9.687469482421875,
+    "pd_logit": 9.58212947845459,
+    "margin_single_minus_pd": 0.10534000396728516
+  }
+]

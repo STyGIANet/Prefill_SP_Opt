@@ -148,8 +148,15 @@ def main():
         help="ISO-8601 arrival time per record for --arrival-pattern trace",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--max-prompt-tokens",
+        type=int,
+        help="Exclude whole records above this capacity; never truncate",
+    )
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
+    if args.max_prompt_tokens is not None and args.max_prompt_tokens <= 0:
+        parser.error("max-prompt-tokens must be positive")
     if args.num_prompts == "all":
         args.num_prompts = None
     else:
@@ -257,12 +264,17 @@ def main():
         tokens = encode_record(tokenizer, text, needed)
         if not tokens or (args.length_mode == "fixed" and len(tokens) < needed):
             continue
-        if len(tokens) + len(bos) > config.max_position_embeddings:
+        if len(tokens) + len(bos) > min(
+            config.max_position_embeddings,
+            args.max_prompt_tokens or config.max_position_embeddings,
+        ):
             excluded_rows.append(
                 {
                     "row_index": row_index,
                     "input_tokens": len(tokens) + len(bos),
-                    "reason": "exceeds_model_context",
+                    "reason": "exceeds_model_context"
+                    if len(tokens) + len(bos) > config.max_position_embeddings
+                    else "exceeds_instance_capacity",
                 }
             )
             continue
@@ -322,8 +334,14 @@ def main():
         "rows_read": rows_read,
         "source_rows": source_rows,
         "excluded_rows": excluded_rows,
-        "excluded_context_records": len(excluded_rows),
+        "excluded_context_records": sum(
+            r["reason"] == "exceeds_model_context" for r in excluded_rows
+        ),
+        "excluded_capacity_records": sum(
+            r["reason"] == "exceeds_instance_capacity" for r in excluded_rows
+        ),
         "model_context_length": config.max_position_embeddings,
+        "instance_capacity_limit": args.max_prompt_tokens,
         "max_prompt_tokens": max(map(len, prompts)),
         "num_prompts": len(prompts),
         "input_tokens": args.input_tokens,
@@ -370,7 +388,7 @@ def main():
         else "arrival_pattern=burst"
     )
     print(
-        f"[dynamic-sp] {load_description}; excluded_context_records={len(excluded_rows)}",
+        f"[dynamic-sp] {load_description}; excluded_context_records={manifest['excluded_context_records']} excluded_capacity_records={manifest['excluded_capacity_records']}",
         flush=True,
     )
     print(

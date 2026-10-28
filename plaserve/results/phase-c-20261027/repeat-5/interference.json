@@ -1,0 +1,12 @@
+{
+  "foreign_users": [],
+  "unknown_owners": [
+    {
+      "utc": "2026-10-27T22:53:26.670584+00:00",
+      "gpu": 5,
+      "pid": "266789"
+    }
+  ],
+  "other_gpu_activity": [],
+  "errors": []
+}

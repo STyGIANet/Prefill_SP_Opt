@@ -485,6 +485,12 @@ def capture_prefill_graph(
         memory_usage_gb: float = 0,
         capture_time: float = 0,
     ) -> GraphCapture:
+        if get_schedule().enable_laps_scheduler and (
+            runner is None or runner is eager_runner
+        ):
+            raise ValueError(
+                "Released LAPS graph execution is unavailable for this model or configuration"
+            )
         return GraphCapture(
             runner=runner,
             memory_phase=memory_phase,
@@ -612,7 +618,7 @@ def capture_prefill_graph(
             context_length,
             model_runner.req_to_token_pool.size,
         )
-        return eager_runner
+        return result(eager_runner)
 
     # Collect attention layers and moe layers from the model. Keep a VLM
     # wrapper that exposes ``language_model`` unchanged: assigning it to
@@ -687,7 +693,12 @@ def capture_prefill_graph(
         f"avail mem={before_mem:.2f} GB"
     )
 
-    prefill_runner = PrefillCudaGraphRunner(model_runner)
+    if get_schedule().enable_laps_scheduler:
+        from sglang.srt.dynamic_sp.laps_released.compat import ReleasedLAPSGraphRunner
+
+        prefill_runner = ReleasedLAPSGraphRunner(model_runner)
+    else:
+        prefill_runner = PrefillCudaGraphRunner(model_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     mem_usage = before_mem - after_mem

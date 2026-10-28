@@ -34,7 +34,12 @@ def read_workload(path):
 
 
 async def benchmark(
-    engine, requests, *, progress_interval=10.0, progress_throughput_target=0.0
+    engine,
+    requests,
+    *,
+    progress_interval=10.0,
+    progress_throughput_target=0.0,
+    baseline="sglang-dp",
 ):
     """Open-loop arrivals: submit without waiting for earlier completions."""
     origin = time.perf_counter()
@@ -63,7 +68,7 @@ async def benchmark(
             else "n/a"
         )
         print(
-            f"[dynamic-sp] progress {bar(len(completed) / len(requests))} baseline=sglang-dp "
+            f"[dynamic-sp] progress {bar(len(completed) / len(requests))} baseline={baseline} "
             f"prompts={len(completed)}/{len(requests)} elapsed={elapsed:.1f}s "
             f"outstanding={submitted - len(completed)} not_arrived={len(requests) - submitted} "
             f"completed_input_tokens={completed_tokens}",
@@ -169,7 +174,7 @@ async def benchmark(
     }
 
 
-def prepare_runtime_workload(engine, requests, args):
+def prepare_runtime_workload(engine, requests, args, *, baseline="DP"):
     """Filter whole records using actual per-replica limits before arrivals start."""
     infos = engine._scheduler_init_result.scheduler_infos
     # Native admission rejects input length >= max_req_input_len. Include the
@@ -188,7 +193,7 @@ def prepare_runtime_workload(engine, requests, args):
                 {
                     "request_id": request["request_id"],
                     "input_tokens": count,
-                    "reason": "exceeds_runtime_dp_capacity",
+                    "reason": f"exceeds_runtime_{baseline.lower()}_capacity",
                 }
             )
     output = Path(args.output)
@@ -217,14 +222,14 @@ def prepare_runtime_workload(engine, requests, args):
         json.dumps(report, indent=2) + "\n"
     )
     print(
-        f"[dynamic-sp] DP runtime input limit={maximum} tokens; "
+        f"[dynamic-sp] {baseline} runtime input limit={maximum} tokens; "
         f"accepted={len(kept)}/{len(requests)} excluded={len(excluded)}; "
         f"no truncation; comparison workload: {workload_path}",
         flush=True,
     )
     if not kept:
         raise ValueError(
-            "No complete prompt fits the native DP runtime capacity; see capacity report"
+            f"No complete prompt fits the native {baseline} runtime capacity; see capacity report"
         )
     return kept, report
 

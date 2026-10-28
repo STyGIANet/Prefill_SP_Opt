@@ -104,6 +104,9 @@ class AsyncScheduler:
         components = []
         for rid in sorted(affected):
             ranks = set(self.requests[rid].ranks)
+            parent_id = self.requests[rid].prompt.prefix_request_id
+            if parent_id is not None and rid in {p.request_id for p in plan.admit}:
+                ranks.update(self.requests[parent_id].ranks)
             ranks.update(
                 r for step in plan.steps if step.request_id == rid for r in step.ranks
             )
@@ -193,6 +196,8 @@ class AsyncScheduler:
                     last_scheduled_version=self.version,
                 )
             self.last_step_seconds = max(r["seconds"] for r in responses)
+            if hasattr(self.policy, "completed_operation"):
+                self.policy.completed_operation(operation, responses)
         self.releasing.difference_update(ids)
         for rid in ids:
             self.inflight.pop(rid)

@@ -1,0 +1,137 @@
+{
+  "status": "failed",
+  "baseline": "single",
+  "candidate": "pd",
+  "model": "Qwen/Qwen2.5-7B",
+  "dtype": "bfloat16",
+  "fp32_lm_head": true,
+  "tp": 2,
+  "backend": "nixl",
+  "kernel_root": "/home/apal/prefill-optimization/PLAserve/results/flashinfer-mask-experiment/saturating-4fbcdb804781",
+  "inputs_sha256": "19a99cdad87128eb1d28a7d209bb46c9c7bb6837f737152910641a3da80f80a2",
+  "kernel_workers": {
+    "single": [
+      2516373,
+      2516374
+    ],
+    "prefill": [
+      2519208,
+      2519209
+    ],
+    "decode": [
+      2517847,
+      2517848
+    ]
+  },
+  "coverage": {
+    "single": {
+      "checks": {
+        "both_workers": true,
+        "any_replay": true,
+        "padded_batch": true,
+        "padded_queries": true,
+        "cached_history": true,
+        "multiple_shapes": true
+      },
+      "replay_events": 40,
+      "shapes": [
+        [
+          2,
+          16
+        ],
+        [
+          2,
+          256
+        ],
+        [
+          4,
+          16
+        ],
+        [
+          4,
+          32
+        ],
+        [
+          4,
+          64
+        ],
+        [
+          8,
+          16
+        ],
+        [
+          8,
+          32
+        ],
+        [
+          8,
+          64
+        ],
+        [
+          8,
+          256
+        ]
+      ]
+    },
+    "pd": {
+      "checks": {
+        "both_workers": true,
+        "any_replay": true,
+        "padded_batch": true,
+        "padded_queries": true,
+        "cached_history": true,
+        "multiple_shapes": true
+      },
+      "replay_events": 44,
+      "shapes": [
+        [
+          2,
+          16
+        ],
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          128
+        ],
+        [
+          2,
+          256
+        ],
+        [
+          4,
+          32
+        ],
+        [
+          4,
+          64
+        ],
+        [
+          4,
+          256
+        ],
+        [
+          8,
+          16
+        ],
+        [
+          8,
+          32
+        ],
+        [
+          8,
+          256
+        ]
+      ]
+    }
+  },
+  "mismatches": 2,
+  "completed_outputs": 98,
+  "api_cache_hits": {
+    "single": 30,
+    "pd": 30
+  },
+  "error": "Exact token mismatches; FP32 investigation required"
+}

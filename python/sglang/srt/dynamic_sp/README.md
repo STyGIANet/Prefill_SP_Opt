@@ -16,6 +16,16 @@ Use `--scheduler tetris --fit-dataset ID --fit-split train` to prepare the prefi
 reuse a frozen profile. Choose evaluation data separately with `--eval-dataset ID --eval-split test`. See [Tetris Prefill Scheduler](TETRIS.md) for 
 calibration, threshold search, launch commands, and the remaining differences from the paper.
 
+## LAPS scheduling
+
+Use `--scheduler laps` for the released LAPS short-first queues and pending-ratio
+instance allocation on native SGLang serving replicas. It uses the current
+Python environment, native paged KV and the released rectangular and piecewise
+CUDA Graph runner, adapted to the current runtime APIs.
+`--laps-config PATH` configures TP size, classification, routing and graphs.
+LAPS is a separate native baseline, excluded from the SP backend sweep.
+See [LAPS native baseline](LAPS.md).
+
 ## Execution Model
 
 For an ordered worker set $R=(r_0,\ldots,r_{d-1})$, the SP degree is $d$ and the owner of absolute token position $p$ is
@@ -205,7 +215,7 @@ not that every concurrent workload fits physical memory. Staged KV and attention
 ./launch_dynamic_sp_8gpu.sh --offered-load 25000
 ```
 
-The default sweep evaluates PG19, arXiv and GovReport test splits, greedy, Tetris and LoongServe SP schedulers, attention backends `ring gathered streaming`, and 
+The default sweep evaluates PG19, arXiv and GovReport test splits, greedy, request, Tetris and LoongServe SP schedulers, attention backends `ring gathered streaming`, and 
 transport settings `targeted all_gather`. Native DP is excluded. The script contains commented model and dataset choices. Dataset sources are 
 [PG19](https://huggingface.co/datasets/emozilla/pg19), [arXiv](https://huggingface.co/datasets/ccdv/arxiv-summarization), and 
 [GovReport](https://huggingface.co/datasets/ccdv/govreport-summarization). Natural length variation is preserved; these are empirical corpora, not 
@@ -263,7 +273,7 @@ workload hash, warmup count, profile and execution settings, and failure status.
 saved atomically after every trial. The process exits unsuccessfully if any trial fails. Throughput includes arrival gaps and queueing and is not a 
 saturated-capacity estimate. TTFT ends at committed sampled-token readiness before response IPC and HTTP.
 
-To run a single scheduler with specific settings, use `--scheduler greedy`, `--scheduler tetris`, or `--scheduler loongserve` and singular `--attention-backend` / 
+To run a single scheduler with specific settings, use `--scheduler greedy`, `--scheduler tetris`, `--scheduler loongserve` and singular `--attention-backend` / 
 `--kv-transport` flags. Matrix mode is selected by the default `--scheduler all`, `--datasets`, or plural backend/transport options. `--prepare-only` 
 performs no GPU execution.
 

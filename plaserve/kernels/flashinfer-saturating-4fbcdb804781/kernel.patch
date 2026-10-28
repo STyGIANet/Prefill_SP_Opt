@@ -1,0 +1,74 @@
+--- original/prefill.cuh
++++ saturating/prefill.cuh
+@@ -1438,7 +1438,7 @@
+         MASK_MODE == MaskMode::kCausal
+             ? min(chunk_size,
+                   sub_if_greater_or_zero(
+-                      kv_len - qo_len + ceil_div(((bx + 1) * CTA_TILE_Q), group_size), chunk_start))
++                      sub_if_greater_or_zero(kv_len + ceil_div(((bx + 1) * CTA_TILE_Q), group_size), qo_len), chunk_start))
+             : chunk_size,
+         CTA_TILE_KV);
+ 
+@@ -1450,7 +1450,7 @@
+     const uint32_t mask_iteration =
+         (MASK_MODE == MaskMode::kCausal
+              ? min(chunk_size,
+-                   sub_if_greater_or_zero(kv_len + ceil_div((bx * CTA_TILE_Q), group_size) - qo_len,
++                   sub_if_greater_or_zero(sub_if_greater_or_zero(kv_len + ceil_div((bx * CTA_TILE_Q), group_size), qo_len),
+                                           chunk_start))
+              : chunk_size) /
+         CTA_TILE_KV;
+@@ -1862,7 +1862,7 @@
+         (MASK_MODE == MaskMode::kCausal
+              ? min(chunk_size,
+                    sub_if_greater_or_zero(
+-                       kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size),
++                       sub_if_greater_or_zero(kv_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size), qo_len),
+                        chunk_start))
+              : chunk_size),
+         CTA_TILE_KV);
+@@ -1876,7 +1876,7 @@
+         (MASK_MODE == MaskMode::kCausal
+              ? min(chunk_size,
+                    sub_if_greater_or_zero(
+-                       kv_len + ceil_div((qo_tile_idx * CTA_TILE_Q), group_size) - qo_len,
++                       sub_if_greater_or_zero(kv_len + ceil_div((qo_tile_idx * CTA_TILE_Q), group_size), qo_len),
+                        chunk_start))
+              : chunk_size) /
+         CTA_TILE_KV;
+@@ -2217,7 +2217,7 @@
+           (MASK_MODE == MaskMode::kCausal
+                ? min(chunk_size,
+                      sub_if_greater_or_zero(
+-                         kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size),
++                         sub_if_greater_or_zero(kv_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size), qo_len),
+                          chunk_start))
+                : chunk_size),
+           CTA_TILE_KV);
+@@ -2225,7 +2225,7 @@
+       num_iterations_prefix = ceil_div(
+           min(min(chunk_size,
+                   sub_if_greater_or_zero(
+-                      kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size),
++                      sub_if_greater_or_zero(kv_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size), qo_len),
+                       chunk_start)),
+               sub_if_greater_or_zero(__ldg(maybe_prefix_len_ptr + request_idx), chunk_start)),
+           CTA_TILE_KV);
+@@ -2243,7 +2243,7 @@
+           num_iterations_mask,
+           ceil_div(min(chunk_size,
+                        sub_if_greater_or_zero(
+-                           kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size),
++                           sub_if_greater_or_zero(kv_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size), qo_len),
+                            chunk_start)),
+                    CTA_TILE_KV));
+     }
+@@ -2257,7 +2257,7 @@
+         (MASK_MODE == MaskMode::kCausal || MASK_MODE == MaskMode::kMultiItemScoring
+              ? min(chunk_size,
+                    sub_if_greater_or_zero(
+-                       kv_len + ceil_div((qo_tile_idx * CTA_TILE_Q), group_size) - qo_len,
++                       sub_if_greater_or_zero(kv_len + ceil_div((qo_tile_idx * CTA_TILE_Q), group_size), qo_len),
+                        chunk_start))
+              : chunk_size) /
+         CTA_TILE_KV;
