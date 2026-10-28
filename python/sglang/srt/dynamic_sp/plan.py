@@ -25,7 +25,6 @@ class PromptStep:
     request_id: str
     ranks: tuple[int, ...]
     end: int
-    use_graph: bool = False
 
 
 @dataclass(frozen=True)

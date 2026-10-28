@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/Jianshu-She/LAPS",
+  "revision": "aa29962d501236ecd2a0c7a8470c5977df3fe057",
+  "graph_source": "python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py",
+  "graph_source_sha256": "d770b0e204bda9cc8987e94ed19a5fc972c4ae1e3f93f263b06d5b624717dc6a",
+  "routing_source": "sgl-model-gateway/bindings/python/src/sglang_router/mini_lb.py",
+  "adaptation": "Released graph runner and extracted queue and routing methods. compat.py maps current runtime APIs; attention.py restores the released attention split; flashinfer_compat.py adapts unsigned causal bounds in an isolated header cache. Prefill-only deployment omits decode transfer and HTTP, completing after the first sampled token.",
+  "queue_source": "python/sglang/srt/disaggregation/prefill.py",
+  "attention_source": "python/sglang/srt/layers/radix_attention.py"
+}

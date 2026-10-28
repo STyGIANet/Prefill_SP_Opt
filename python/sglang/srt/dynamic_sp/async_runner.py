@@ -41,17 +41,6 @@ def run_async(args, model, control, scheduler, arrivals, plans):
         "shared_attention": args.shared_attention,
         "migration_overlap": getattr(args, "migration_overlap", True),
     }
-    if args.scheduler == "laps":
-        from dataclasses import asdict
-        from sglang.srt.dynamic_sp.laps import LAPSConfig
-
-        laps_options = LAPSConfig.read(args.laps_config)
-        options["prefill_graph_options"] = asdict(laps_options)
-        options["memory_execution_tokens"] = max(
-            args.max_batch_tokens,
-            laps_options.long_chunk_tokens,
-            laps_options.short_token_budget,
-        )
     prefill_world = dist.get_world_size() - args.decode_gpus
     instances = _decode_instances(args)
     prewarm = prewarm_memberships(prefill_world, args.prewarm_groups)
@@ -130,12 +119,6 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
         args.max_batch_tokens,
     )
     policy = scheduler.policy if scheduler is not None else GreedyScheduler(config)
-    if args.scheduler == "laps":
-        import torch
-
-        policy.read_utilization = lambda: tuple(
-            torch.cuda.utilization(rank) / 100.0 for rank in range(config.world_size)
-        )
     driver = AsyncScheduler(policy, config, model)
     decode = (
         DecodeCoordinator(
@@ -285,12 +268,7 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
                     pending[prompt.request_id] = {
                         "request_id": prompt.request_id,
                         "input_tokens": len(prompt.token_ids) - prompt.prefix_length,
-                        "ttft_slo_seconds": prompt.ttft_slo_seconds
-                        or (
-                            policy.options.deadline_seconds
-                            if args.scheduler == "laps"
-                            else None
-                        ),
+                        "ttft_slo_seconds": prompt.ttft_slo_seconds,
                         "arrival_time_seconds": timestamp - origin,
                         "submission_time_seconds": timestamp + delay - origin,
                     }
@@ -542,11 +520,6 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
             f"p95={summary['ttft_p95_seconds']:.3f}s prompts={len(latencies)}; excludes response IPC and HTTP",
             flush=True,
         )
-    if args.scheduler == "laps":
-        print(
-            f"[dynamic-sp] laps graph_replays={summary['prefill_graph_replays']} controller_moves={policy.moves} SLO_violations={summary['slo_violations']}/{summary['slo_requests']}",
-            flush=True,
-        )
     if args.output:
         Path(args.output).write_text(
             json.dumps(
@@ -557,10 +530,9 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
                     "dtype": args.dtype,
                     "scheduler": args.scheduler if plans is None else "replay",
                     "scheduler_settings": {
-                        "laps": policy.metadata() if args.scheduler == "laps" else None,
                         **vars(config),
                         "tetris": policy.metadata()
-                        if hasattr(policy, "metadata") and args.scheduler != "laps"
+                        if hasattr(policy, "metadata")
                         else None,
                     },
                     "arrival_records": arrival_records,

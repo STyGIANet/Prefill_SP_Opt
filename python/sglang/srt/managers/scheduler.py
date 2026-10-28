@@ -4120,10 +4120,17 @@ class Scheduler(
                 self.prefill_delayer, token_usage=max_pool_usage
             )
 
-        ret, running_batch = self._get_new_batch_prefill_raw(
-            prefill_delayer_single_pass=prefill_delayer_single_pass,
-            running_batch=running_batch,
-        )
+        if get_schedule().enable_laps_scheduler:
+            from sglang.srt.managers.laps_scheduler import build_laps_prefill
+
+            ret, running_batch = build_laps_prefill(
+                self, running_batch, prefill_delayer_single_pass
+            )
+        else:
+            ret, running_batch = self._get_new_batch_prefill_raw(
+                prefill_delayer_single_pass=prefill_delayer_single_pass,
+                running_batch=running_batch,
+            )
 
         if self.prefill_delayer:
             observed_prefill_bs = prefill_delayer_single_pass.finalize(

@@ -1,132 +1,123 @@
-# LAPS prefill scheduling
+# LAPS native baseline
 
-`--scheduler laps` selects length-aware prefill scheduling from
-[LAPS](https://arxiv.org/abs/2601.11589), Sections 2.1 and 3.1-3.2.
-Short and long requests use separate queues. Short requests form padded,
-length-bucketed batches with CUDA Graph execution. Long requests execute one
-request per instance in fixed-size chunks. The implementation uses native
-SGLang weights and KV slots through the shared asynchronous prefill backend.
+`--scheduler laps` runs the released LAPS scheduling policy on this checkout's
+native SGLang Engine. It uses the existing Python environment and model
+installation. No separate environment or vendor installation is required. If
+`CUDA_HOME` is unset, the runner selects an existing `/usr/local/cuda-VERSION`
+toolkit matching PyTorch when available. An explicit `CUDA_HOME` is preserved.
+
+The scheduling source is [Jianshu-She/LAPS at aa29962d](https://github.com/Jianshu-She/LAPS/tree/aa29962d501236ecd2a0c7a8470c5977df3fe057).
+The server policy is adapted from `_get_next_laps_batch_to_run` and
+`_build_batch_from_queue` in `disaggregation/prefill.py`. The instance policy is
+adapted from `_laps_maybe_rebalance`, `select_pair_laps` and `laps_request_done`
+in the authors' `mini_lb.py`.
 
 ## Scheduling
 
-The default short-prefill boundary is 256 new tokens, as in the
-[released implementation](https://github.com/Jianshu-She/LAPS/tree/aa29962d501236ecd2a0c7a8470c5977df3fe057).
-`boundary_coefficients` optionally supplies the independently fitted
-`[alpha, beta, gamma_w, gamma_r]` costs from Section 2.1. The default threshold
-is an explicit configuration value, not a measured hardware boundary.
+Each serving replica separates requests at 256 input tokens. It attempts the
+short queue first and then the long queue when no short batch can be admitted.
+Native SGLang performs KV admission, chunk continuation, batching and execution.
+A resident chunk remains under the native chunk scheduler, as in the released
+implementation.
 
-Adaptive Wait-Depth batching maintains a waiting window and target batch depth
-for each instance. Requests are selected bucket-first under the KV and short
-batch token budgets. A batch dispatches when it reaches its target depth or
-token budget, its waiting window expires, its oldest request reaches the maximum
-queue wait, or its deadline slack reaches the safety threshold. After dispatch,
-a full batch updates the waiting window using its fill time; an underfilled
-batch reduces the target depth. Deadline-aware waiting uses the tighter of the
-remaining deadline budget and estimated time to fill the graph shape.
+The coordinator divides replicas into short and long pools. It routes each
+request randomly within its class pool and tracks outstanding requests by
+class. Every five seconds, evaluated on an arrival, it moves one instance when
+one class has more than twice the other's outstanding requests. Both counts
+are floored at one for this comparison, and each pool retains at least one
+instance. Reassignment changes routing for subsequent requests; it does not
+migrate requests already assigned. The routing seed is fixed by default.
 
-Single-instance execution alternates short batches and long chunks. Long
-chunks may execute while short requests accumulate. Urgent requests take
-priority when deadlines are supplied. Multiple instances are divided into
-short and long pools. The controller compares nearest-rank P90 pressures,
-using queue depth, deadline deviation and GPU utilization. Virtual
-round-robin routing converts each global queue into per-instance backlog
-observations without allocating KV to queued requests. At most one idle
-instance changes pools per control interval, subject to hysteresis, cooldown
-and minimum pool sizes. Instances with resident KV drain before reassignment.
-GPU utilization is read through NVML at control intervals.
-`utilization_signal: "occupancy"` instead uses committed operation intervals and
-active leases. This alternative avoids reliance on hardware utilization counters
-but is a different pressure signal.
+These are the released implementation's policies. They do not implement the
+paper's runtime boundary fitting, adaptive wait/depth algorithm or P90 pressure
+controller. The default released benchmark also does not enable the separate
+waiting-window branch. See the [paper](https://arxiv.org/abs/2601.11589) for those
+designs.
 
-## Execution
+## Native execution
 
-The default graph grid is the Cartesian product of prompt lengths
-`[8, 16, 32, 64, 128, 256]` and batch sizes `[1, 2, 4, 8, 16, 32, 64]`.
-Memory-infeasible shapes are excluded. Capture precedes workload arrivals.
-Replay updates token IDs, positions, sequence lengths and KV slot indices in
-stable device buffers. Padding is excluded from KV writes and causal attention.
-Attention reads historical KV directly from the native slot pool and uses FP32
-softmax accumulation. Graph execution uses BF16 or FP16 weights. Shapes outside the captured grid use standard execution.
-Graphs and scratch storage persist across benchmark phases; prompt KV does not.
+The default deployment has eight replicas, one per GPU. `tp_size` can be 1, 2,
+4 or 8; the number of replicas is `8 / tp_size`. With one replica, only the
+server's temporal queue policy applies. LAPS does not partition a sequence or
+change its SP degree.
 
-An instance contains one GPU by default. `instance_degree` configures a fixed
-SP group for long requests. Short batches execute on that group's first GPU;
-other group members remain reserved for the instance. This SP mapping is a
-backend extension, not a placement policy proposed by LAPS. Instance degree is
-not selected dynamically per request. A full prompt must fit the instance's
-aggregate KV capacity even when it is chunked. Unsupported inputs fail without
-truncation.
+Prefill uses the released `PiecewiseCudaGraphRunner`, including rectangular
+batch graphs with batch sizes `[1, 2, 4, 8]` and query lengths
+`[16, 32, 64, 128, 256]`. Real queries are right-aligned in each padded row.
+Batch graphs take priority when eligible; otherwise execution uses the released
+piecewise token buckets, followed by eager execution outside those buckets.
+The piecewise grid is generated from the chunk size using the released rule.
+The graph runner and queue and routing methods are vendored under
+`laps_released/`, with the source revision recorded in `UPSTREAM.json`.
 
-Workload records are independent by default. A record with `retain_kv: true`
-retains its prefix for a later record naming it through `prefix_request_id`.
-The continuation's `token_ids` must contain the complete parent prefix followed
-by new tokens. Its class is determined by new-token length and historical
-context. Prefix ownership transfers atomically, including between short and
-long pools; historical tokens are not recomputed. Each prefix has one successor.
-Retained KV is released after its final use or when the arrival stream is exhausted.
-Graphs read retained histories directly from paged storage. A history that does
-not fit on one GPU uses the instance's SP execution path. Branching conversations,
-decoding, HTTP routing and PD KV transfer are outside this prefill baseline.
+The compatibility layer maps the released runner's batch, attention metadata,
+compilation context and residual bookkeeping APIs to this checkout. The
+piecewise attention boundary passes only real query rows to FlashInfer, whose
+current API requires an exact match with its planned row count. Padding remains
+in the tokenwise graph operations and is excluded from returned logits. FlashInfer
+uses an isolated header and compilation cache under `work/laps-flashinfer/`.
+The header adaptation saturates unsigned causal tile bounds when a padded query
+row is longer than its real KV sequence. It preserves right-aligned causal
+visibility and leaves installed packages unchanged. The installed header hash
+must match the reviewed version; a different version requires review.
 
-## Configuration
+The supported path is dense, full-attention text inference with FlashInfer,
+without LoRA or speculative decoding. The custom SP LAPS scheduler and private
+attention kernel are removed.
+
+Each request generates one token on its assigned replica. There is no separate
+decode deployment, HTTP router or prefill-to-decode transfer in this prefill
+baseline. Native DP routing carries the authors' instance selections. This
+preserves the existing experiment's first-token completion boundary without
+introducing a separate serving environment. Pending counters are released when
+the one-token response completes, rather than after a remote decode response.
+These deployment and completion changes are specific to the prefill-only
+experiment; end-to-end serving latency is not equivalent to the released
+prefill/decode deployment.
+
+## Invocation
 
 ```bash
-./launch_dynamic_sp_8gpu.sh --scheduler laps \
+./launch_dynamic_sp_8gpu.sh \
+  --scheduler laps \
   --eval-dataset emozilla/pg19 --eval-split test \
-  --laps-config python/sglang/srt/dynamic_sp/laps_config.json
+  --offered-load 25000 --no-verify
 ```
 
-`--laps-config PATH` supplies a JSON object; omitted fields use the defaults
-below. No GPU calibration or dataset fitting runs automatically.
+`--offered-load` is expected input tokens per second. The prepared Poisson
+arrival offsets are preserved. Model, dataset, split, prompt count and warmup
+options use the common launcher. SP attention and KV transport options do not
+apply. Native settings are supplied through
+`--laps-config python/sglang/srt/dynamic_sp/laps_native.json`.
 
-| Field | Default |
-|---|---:|
-| `instance_degree` | 1 |
-| `length_threshold` | 256 |
-| `long_chunk_tokens` | 8192 |
-| `short_token_budget` | 16384 |
-| `wait_min_seconds` | 0 |
-| `wait_max_seconds` | 0.005 |
-| `max_queue_wait_seconds` | 0.05 |
-| `deadline_seconds` | null |
-| `slack_seconds` | 0.001 |
-| `safety_seconds` | 0.001 |
-| `initial_service_seconds` | 0.005 |
-| `control_period_seconds` | 1 |
-| `cooldown_seconds` | 5 |
-| `hysteresis` | 0.2 |
-| `minimum_instances` | 1 |
-| `queue_weight`, `deadline_weight`, `utilization_weight` | 1 |
-| `utilization_signal` | `gpu` |
+The requested KV capacity defaults to 600000 tokens per replica. The actual
+native allocation can be smaller. Before arrivals begin, the runner filters
+whole records against the smallest runtime input limit across replicas and
+writes `results.capacity.json` and `results.workload.json`. Inputs are never
+silently truncated. Filtered records retain their original arrival offsets;
+filtering therefore reduces the effective offered load.
 
-`graph_lengths` and `graph_batches` override the captured shapes. Both must
-contain ascending distinct powers of two. Controller timing, weights and safety
-values are configurable choices because the paper does not specify a complete
-parameter set. Service estimates use an exponential moving average of completed
-operations. Arrival-rate estimates use the most recent 256 short arrivals.
+Warmup covers every replica unless disabled with `--warmup-requests 0`. Warmup
+inputs may be shortened to the warmup budget; measured inputs are unchanged.
+KV state is cleared before measured arrivals, and prefix reuse is disabled.
 
-A workload record may set `ttft_slo_seconds`; otherwise `deadline_seconds`
-applies. A null deadline selects deadline-free batching. All deadlines are
-relative to scheduled arrival, preserving producer and queueing delays.
-TTFT ends at committed first-token sampling, as for the other SP policies.
-Throughput uses unpadded new input tokens and the common first-submission-to-last-completion
-measurement window. Results retain the LAPS configuration and controller state.
+For a dataset sweep, use `--scheduler laps --datasets "pg19 arxiv govreport"`.
+Each dataset is evaluated once per repeat with the native configuration.
+`--scheduler all` remains the SP-only sweep.
 
-The launcher excludes whole dataset records exceeding the fixed instance KV
-capacity. When LAPS is included in a benchmark sweep, the same capacity filter
-is applied to the shared workload before any scheduler runs. Exclusions are
-recorded in the manifest. Reusing a prepared workload does not silently modify
-it; unsupported lengths are rejected before execution.
+## Measurements
 
-For independent boundary measurements, `laps_profile` fits the two Section 2.1
-cost equations using nonnegative least squares. Input JSON contains `samples`
-with `new_tokens`, `history_tokens`, `compute_seconds` and `memory_seconds`, plus
-optional measurement `metadata`. Durations must be separately measured phases;
-a total-latency sample cannot identify compute and memory costs. The command
-writes a configuration containing `boundary_coefficients` and a companion fit
-report. Fitting is explicit and does not inspect evaluation requests.
+TTFT is measured from scheduled arrival to the native scheduler's first sampled
+token becoming available on the CPU. It excludes response IPC and HTTP, matching
+the native DP baseline. Response latency is also retained separately. Median
+and nearest-rank p95 are computed over individual prompt TTFT values.
 
-```bash
-python -m sglang.srt.dynamic_sp.laps_profile \
-  --samples boundary-samples.json --output laps-config.json
-```
+Throughput is completed input tokens divided by the interval from first actual
+submission to last first-token completion. It includes queueing and arrival
+gaps. Progress reports show completed prompts, input tokens per second and
+TTFT percentiles.
+
+Each run writes `results.json`, `laps-settings.json` and `metrics.csv`. Results
+record the upstream revision, effective native settings, routing assignments,
+pool changes and evaluated workload hash. The native benchmark does not collect
+allocator retry or graph replay counters; those fields are left unset.

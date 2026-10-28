@@ -100,7 +100,6 @@ def read_schedule(path):
                     s["request_id"],
                     tuple(s["ranks"]),
                     s["end"],
-                    s.get("use_graph", False),
                 )
                 for s in p.get("steps", [])
             ),
@@ -185,7 +184,7 @@ def main():
     parser.add_argument(
         "--scheduler",
         default="greedy",
-        help="greedy, request, dynamic, tetris, loongserve, laps, or module:factory taking SchedulerConfig",
+        help="greedy, request, dynamic, tetris, loongserve, or module:factory taking SchedulerConfig",
     )
     # Tetris Implementation
     parser.add_argument(
@@ -294,16 +293,11 @@ def main():
     parser.add_argument(
         "--output", help="Save JSON validation/timing results on worker zero"
     )
-    parser.add_argument(
-        "--laps-config", help="LAPS scheduling and graph configuration JSON"
-    )
     args = parser.parse_args()
-    if args.scheduler == "laps" and (
-        args.execution_mode != "async"
-        or args.decode_gpus
-        or args.loongserve_elastic_decode
-    ):
-        parser.error("LAPS uses async prefill-only execution")
+    if args.scheduler == "laps":
+        parser.error(
+            "LAPS uses the native runtime. Launch with ./launch_dynamic_sp_8gpu.sh --scheduler laps"
+        )
     if any(
         not math.isfinite(v) or v < 0
         for v in (args.progress_interval, args.progress_throughput_target)
@@ -431,10 +425,6 @@ def main():
             )
             if args.scheduler == "greedy":
                 policy = GreedyScheduler(config)
-            elif args.scheduler == "laps":
-                from sglang.srt.dynamic_sp.laps import LAPSScheduler, LAPSConfig
-
-                policy = LAPSScheduler(config, LAPSConfig.read(args.laps_config))
             elif args.scheduler == "request":
                 from sglang.srt.dynamic_sp.dynamic_scheduler import RequestSpScheduler
 
@@ -526,11 +516,9 @@ def main():
                 parent = (
                     workload_prompts.get(parent_id) if parent_id is not None else None
                 )
-                if parent_id is not None and (
-                    args.scheduler != "laps" or parent is None or not parent.retain_kv
-                ):
+                if parent_id is not None:
                     raise ValueError(
-                        "A LAPS prefix must reference an earlier retain_kv workload record"
+                        "Retained-prefix workload chains are not supported by the selected scheduler"
                     )
                 prompt = Prompt(
                     row["request_id"],
@@ -564,14 +552,6 @@ def main():
                     raise ValueError("Workload request IDs must be unique and nonempty")
                 if not prompt.token_ids or len(prompt.token_ids) > model.context_length:
                     raise ValueError("Prompt length is outside model context")
-                if (
-                    args.scheduler == "laps"
-                    and len(prompt.token_ids)
-                    > policy.options.instance_degree * config.max_local_tokens
-                ):
-                    raise ValueError(
-                        "LAPS workload exceeds fixed instance capacity; prepare with --max-prompt-tokens or increase instance_degree"
-                    )
                 if len(prompt.token_ids) > config.world_size * config.max_local_tokens:
                     raise ValueError("Prompt exceeds aggregate KV capacity")
                 if any(

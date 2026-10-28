@@ -83,6 +83,11 @@ class Schedule(msgspec.Struct):
         Optional[int],
         "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
     ] = None
+    laps_graph_config: A[str, "Released LAPS graph configuration as JSON."] = ""
+    enable_laps_scheduler: A[
+        bool, "Use the released LAPS short-first prefill queues."
+    ] = False
+    laps_length_threshold: A[int, "LAPS short-request input length threshold."] = 256
     schedule_policy: A[
         str,
         Arg(

@@ -96,7 +96,6 @@ class GroupWorker:
         self.model = model
         self.options = dict(options)
         execution_tokens = self.options.pop("memory_execution_tokens", 32768)
-        graph_options = self.options.pop("prefill_graph_options", None)
         self.verify, self.atol, self.rtol = verify, atol, rtol
         self.timeout = timeout
         self.store = store
@@ -112,17 +111,6 @@ class GroupWorker:
             options.get("attention_backend", "gathered"),
             execution_tokens=execution_tokens,
         )
-        self.prefill_graph = None
-        if graph_options is not None:
-            from sglang.srt.dynamic_sp.prefill_graph import PrefillGraphCache
-
-            self.prefill_graph = PrefillGraphCache(
-                model,
-                self.kv_pool,
-                graph_options["graph_lengths"],
-                graph_options["graph_batches"],
-                graph_options["short_token_budget"],
-            )
         self.decode = next(
             (
                 DecodeInstanceRank(model, members, self.rank, decode_kv_tokens)
@@ -147,7 +135,6 @@ class GroupWorker:
                 kv_pool=self.kv_pool,
                 **self.options,
             )
-            engine.prefill_graph = self.prefill_graph if len(members) == 1 else None
             self.groups[members] = (ticket, communication, engine)
         return self.groups[members][-1]
 
@@ -272,9 +259,7 @@ class GroupWorker:
         plan = PrefillPlan(
             0,
             tuple(
-                PromptStep(
-                    s.request_id, tuple(local[r] for r in s.ranks), s.end, s.use_graph
-                )
+                PromptStep(s.request_id, tuple(local[r] for r in s.ranks), s.end)
                 for s in operation.plan.steps
             ),
             operation.plan.admit,
@@ -310,16 +295,6 @@ class GroupWorker:
                     )
 
             def check_and_stage():
-                if (
-                    engine.metrics.get("prefill_graph_replays")
-                    and outputs
-                    and not torch.stack(
-                        [torch.isfinite(v).all() for v in outputs.values()]
-                    )
-                    .all()
-                    .item()
-                ):
-                    raise RuntimeError("Nonfinite prefill graph logits")
                 errors = {}
                 if self.verify and engine.rank == 0:
                     from sglang.srt.dynamic_sp.__main__ import reference_logits

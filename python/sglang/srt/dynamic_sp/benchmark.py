@@ -197,6 +197,15 @@ def main():
     )
     if "sglang-dp" in schedulers:
         parser.error("This benchmark compares SP schedulers only")
+    if args.scheduler == "laps" and (
+        args.attention_backends
+        or args.attention_backend
+        or args.kv_transports
+        or args.kv_transport
+    ):
+        parser.error(
+            "LAPS uses native attention. Configure it with --laps-config; SP backend/transport sweeps do not apply."
+        )
     backends = (
         args.attention_backends or args.attention_backend or "ring gathered streaming"
     ).split()
@@ -258,7 +267,11 @@ def main():
                 proc.wait()
                 raise
 
-    combinations = list(itertools.product(schedulers, backends, transports))
+    combinations = (
+        [("laps", "native", "none")]
+        if args.scheduler == "laps"
+        else list(itertools.product(schedulers, backends, transports))
+    )
     for name, dataset, config, column in datasets:
         directory = output / name
         directory.mkdir()
@@ -278,18 +291,6 @@ def main():
             "--output-dir",
             str(prepared),
         ]
-        if "laps" in schedulers:
-            from sglang.srt.dynamic_sp.laps import LAPSConfig
-
-            capacity = (
-                int(common[common.index("--max-local-tokens") + 1])
-                if "--max-local-tokens" in common
-                else 131072
-            )
-            limit = LAPSConfig.read(args.laps_config).instance_degree * capacity
-            if "--max-prompt-tokens" in common:
-                limit = min(limit, int(common[common.index("--max-prompt-tokens") + 1]))
-            flags += ["--max-prompt-tokens", str(limit)]
         if args.workload_dir:
             flags += ["--workload-dir", args.workload_dir]
         code = run(flags, directory / "prepare.log")
@@ -364,8 +365,17 @@ def main():
                         "--output-dir",
                         str(target),
                     ]
-                    if scheduler == "laps" and args.laps_config:
-                        flags += ["--laps-config", args.laps_config]
+                    if scheduler == "laps":
+                        flags = [
+                            "--scheduler",
+                            scheduler,
+                            "--workload-dir",
+                            str(prepared),
+                            "--output-dir",
+                            str(target),
+                        ]
+                        if args.laps_config:
+                            flags += ["--laps-config", args.laps_config]
                     if scheduler == "loongserve":
                         profile = (
                             Path(args.loongserve_profile).resolve()
@@ -442,8 +452,22 @@ def main():
                             f"Trial exited {status}; see {target / 'benchmark.log'}"
                         )
                     result = json.loads((target / "results.json").read_text())
+                    measured_workload = workload
+                    if scheduler == "laps":
+                        capacity = result["capacity_filter"]
+                        measured_workload = json.loads(
+                            Path(capacity["evaluated_workload"]).read_text()
+                        )
+                        row.update(
+                            workload_sha256=capacity["evaluated_workload_sha256"],
+                            excluded_capacity_records=capacity["excluded_prompts"],
+                            attention_backend=result["engine_settings"][
+                                "attention_backend"
+                            ],
+                            effective_attention_transport="native_dp",
+                        )
                     row.update(
-                        measured_metrics(result, workload),
+                        measured_metrics(result, measured_workload),
                         status="ok",
                         dtype=result.get("dtype", ""),
                     )

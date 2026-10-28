@@ -98,7 +98,7 @@ Options:
   --input-tokens N       all (default) preserves full records; integer sets an explicit cap
   --length-mode MODE     natural (default) or fixed evaluation lengths
   --chunk-tokens N       Prefill tokens per step (default: 1024)
-  --max-local-tokens N   KV capacity per worker (default: SP 131072; DP 600000)
+  --max-local-tokens N   KV capacity per worker (default: SP 131072; native DP/LAPS 600000)
   --attention-backend NAME  ring (default), gathered, or streaming
   --no-migration-overlap    Disable layer-wise KV migration overlap
   --tetris-fit-method NAME  nonnegative (default) or least-squares
@@ -108,7 +108,7 @@ Options:
   --arrival-pattern P   poisson (default) or burst for saturation tests
   --execution-mode MODE async (default) or sync SP execution
   --max-prompt-tokens N Exclude longer records without truncation
-  --laps-config PATH   LAPS scheduling and graph configuration JSON
+  --laps-config PATH   Native LAPS replica/router/graph settings JSON
   --scheduler NAME      all SP schedulers (default), greedy, request, tetris, loongserve, laps, or module:factory
   --sp-sizes LIST        Request scheduler block sizes, e.g. 1,2,4,8
   --size-thresholds LIST Request scheduler length thresholds, e.g. 256,1024,4096
@@ -187,7 +187,7 @@ while (($#)); do
                 printf 'Missing value for %s\n' "$1" >&2; exit 2
             fi
             case "$1" in
-                --laps-config) laps_config="$2"; runner_args+=("$1" "$2") ;;
+                --laps-config) laps_config="$2" ;;
                 --loongserve-calibration-concurrency) loongserve_calibration_concurrency="$2" ;;
                 --loongserve-calibration-grid) loongserve_calibration_grid="$2" ;;
                 --loongserve-profile) loongserve_profile="$2" ;;
@@ -256,8 +256,22 @@ while (($#)); do
     esac
 done
 
+if [[ "$scheduler" == laps ]]; then
+    for option in "${original_args[@]}"; do
+        case "$option" in
+            --attention-backend|--attention-backends|--kv-transport|--kv-transports|--shared-attention|--no-migration-overlap|--sp-sizes|--size-thresholds)
+                printf 'LAPS uses native serving replicas. Use --laps-config for native attention and TP settings; SP backend options do not apply.\n' >&2
+                exit 2 ;;
+        esac
+    done
+    if [[ "$execution_mode" != async ]]; then
+        printf 'LAPS uses the native asynchronous Engine. SP sync mode does not apply.\n' >&2
+        exit 2
+    fi
+fi
+
 if [[ -z "$max_local_tokens" ]]; then
-    if [[ "$scheduler" == sglang-dp ]]; then
+    if [[ "$scheduler" == sglang-dp || "$scheduler" == laps ]]; then
         max_local_tokens=600000
     else
         max_local_tokens=131072
@@ -338,10 +352,6 @@ for path in "$tetris_profile" "$tetris_samples" "$loongserve_profile" "$loongser
         printf 'Cannot read scheduler profile/samples: %s\n' "$path" >&2; exit 2
     fi
 done
-if [[ "$scheduler" == laps ]]; then
-    laps_capacity="$("$python_bin" -c 'import sys; from sglang.srt.dynamic_sp.laps import LAPSConfig; print(LAPSConfig.read(sys.argv[1] or None).instance_degree * int(sys.argv[2]))' "$laps_config" "$max_local_tokens")"
-    prepare_args+=(--max-prompt-tokens "$laps_capacity")
-fi
 if [[ -n "$workload_dir" ]]; then
     for name in workload.json manifest.json; do
         if [[ ! -r "$workload_dir/$name" ]]; then
@@ -407,6 +417,22 @@ run_logged() {
         exit 1
     fi
 }
+if [[ "$scheduler" == laps ]]; then
+    if [[ "$verify_flag" == --verify ]]; then
+        printf 'LAPS uses native SGLang; SP reference-logit verification is unavailable. Use --no-verify.\n' >&2
+        exit 2
+    fi
+    laps_args=()
+    if [[ -n "$laps_config" ]]; then laps_args+=(--laps-config "$laps_config"); fi
+    run_logged "${output_dir}/run.log" "$python_bin" -m sglang.srt.dynamic_sp.laps_baseline \
+        --model-path "$model_path" --dtype "$dtype" \
+        --workload "${output_dir}/workload.json" --output "${output_dir}/results.json" \
+        --chunk-size "$chunk_tokens" --max-local-tokens "$max_local_tokens" \
+        --max-running-requests "$max_running_requests" --max-batch-tokens "$max_batch_tokens" \
+        --warmup-requests "$warmup_requests" --warmup-tokens "$warmup_tokens" \
+        --progress-throughput-target "$offered_load" "${laps_args[@]}" "${runner_args[@]}"
+    exit 0
+fi
 if [[ "$scheduler" == loongserve ]]; then
     if [[ "$execution_mode" != async ]]; then
         printf 'LoongServe requires async execution.\n' >&2; exit 2

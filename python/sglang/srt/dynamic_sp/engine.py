@@ -492,9 +492,6 @@ class DynamicSPPrefillEngine:
             # synchronize hosts at each projection, attention and MLP phase.
             self._local_checks_only = self.communication is not None
             try:
-                self._graph_requested = bool(plan.steps) and all(
-                    s.use_graph for s in plan.steps
-                )
                 outputs = self._prefill_batch(forwards) if forwards else {}
             finally:
                 self._local_checks_only = False
@@ -685,22 +682,6 @@ class DynamicSPPrefillEngine:
         return states
 
     def _prefill_batch(self, forwards):
-        graph = getattr(self, "prefill_graph", None)
-        if (
-            graph is not None
-            and getattr(self, "_graph_requested", False)
-            and graph.shape(forwards) is not None
-        ):
-            if self._migration is not None:
-                self._migration.wait(0)
-                for layer in range(1, self.model.num_layers):
-                    self._migration.launch(layer)
-                    self._migration.wait(layer)
-                self._migration.drain()
-                self._migration = None
-            outputs = graph.run(forwards, self.logits_mode)
-            self.metrics["prefill_graph_replays"] = 1
-            return outputs
         m = self.model
         layouts = []
         all_positions, all_ids = [], []
