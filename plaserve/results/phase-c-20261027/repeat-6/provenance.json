@@ -1,0 +1,23 @@
+{
+  "upstream_script": "/home/apal/prefill-optimization/PLAserve/vendor/LAPS/bench_laps_prefill_throughput/scripts/bench_h100_4gpu.sh",
+  "upstream_sha256": "5829eeed8c721c087777696fdf35bbf593e494e66e0f8a8a960cb999c761c009",
+  "guarded_sha256": "6f42ee9249ebf8cdd8efee2fd02db1aea0058af47619a4a2e0a5f8c944a28d2d",
+  "vendor_head": "88b986375b531b2f09261b9f44628a24a9c0d6d7",
+  "prefill_gpus": [
+    2,
+    3
+  ],
+  "decode_gpus": [
+    4,
+    5
+  ],
+  "ports": [
+    30300,
+    30301,
+    30302,
+    9300,
+    9301
+  ],
+  "vendor_diff": "vendor.diff",
+  "vendor_diff_sha256": "da2d03fadfdb9d927155798fc0b657235a0223ab9ddb78204c22c5c2baad6a35"
+}

@@ -1,0 +1,467 @@
+{
+  "foreign_users": [
+    {
+      "utc": "2026-10-27T21:53:18.793348+00:00",
+      "gpu": 2,
+      "pid": "230421",
+      "user": "vamsi",
+      "command": "/home/vamsi/src/codebase/Prefill_SP_Opt/.venv/bin/python -u -m sglang.srt.dynamic_sp --scheduler laps --laps-config python/sglang/srt/dynamic_sp/work/laps-validation/config.json --model-path python/sglang/srt/dynamic_sp/work/dp-tiny-llama --workload python/sglang/srt/dynamic_sp/work/laps-validation/workload.json --max-local-tokens 256 --max-batch-tokens 128 --execution-mode async --warmup-requests 0 --prewarm-groups none --verify --atol 0.01 --rtol 0.01 --output python/sglang/srt/dynamic_sp/work/laps-validation/results.json"
+    },
+    {
+      "utc": "2026-10-27T21:53:18.793348+00:00",
+      "gpu": 3,
+      "pid": "230422",
+      "user": "vamsi",
+      "command": "/home/vamsi/src/codebase/Prefill_SP_Opt/.venv/bin/python -u -m sglang.srt.dynamic_sp --scheduler laps --laps-config python/sglang/srt/dynamic_sp/work/laps-validation/config.json --model-path python/sglang/srt/dynamic_sp/work/dp-tiny-llama --workload python/sglang/srt/dynamic_sp/work/laps-validation/workload.json --max-local-tokens 256 --max-batch-tokens 128 --execution-mode async --warmup-requests 0 --prewarm-groups none --verify --atol 0.01 --rtol 0.01 --output python/sglang/srt/dynamic_sp/work/laps-validation/results.json"
+    },
+    {
+      "utc": "2026-10-27T21:53:23.997844+00:00",
+      "gpu": 2,
+      "pid": "230421",
+      "user": "vamsi",
+      "command": "/home/vamsi/src/codebase/Prefill_SP_Opt/.venv/bin/python -u -m sglang.srt.dynamic_sp --scheduler laps --laps-config python/sglang/srt/dynamic_sp/work/laps-validation/config.json --model-path python/sglang/srt/dynamic_sp/work/dp-tiny-llama --workload python/sglang/srt/dynamic_sp/work/laps-validation/workload.json --max-local-tokens 256 --max-batch-tokens 128 --execution-mode async --warmup-requests 0 --prewarm-groups none --verify --atol 0.01 --rtol 0.01 --output python/sglang/srt/dynamic_sp/work/laps-validation/results.json"
+    },
+    {
+      "utc": "2026-10-27T21:53:23.997844+00:00",
+      "gpu": 3,
+      "pid": "230422",
+      "user": "vamsi",
+      "command": "/home/vamsi/src/codebase/Prefill_SP_Opt/.venv/bin/python -u -m sglang.srt.dynamic_sp --scheduler laps --laps-config python/sglang/srt/dynamic_sp/work/laps-validation/config.json --model-path python/sglang/srt/dynamic_sp/work/dp-tiny-llama --workload python/sglang/srt/dynamic_sp/work/laps-validation/workload.json --max-local-tokens 256 --max-batch-tokens 128 --execution-mode async --warmup-requests 0 --prewarm-groups none --verify --atol 0.01 --rtol 0.01 --output python/sglang/srt/dynamic_sp/work/laps-validation/results.json"
+    },
+    {
+      "utc": "2026-10-27T21:53:44.811530+00:00",
+      "gpu": 2,
+      "pid": "231734",
+      "user": "vamsi",
+      "command": "/home/vamsi/src/codebase/Prefill_SP_Opt/.venv/bin/python -u -m sglang.srt.dynamic_sp --scheduler laps --laps-config python/sglang/srt/dynamic_sp/work/laps-validation/config.json --model-path python/sglang/srt/dynamic_sp/work/dp-tiny-llama --workload python/sglang/srt/dynamic_sp/work/laps-validation/workload.json --max-local-tokens 256 --max-batch-tokens 128 --execution-mode async --warmup-requests 0 --prewarm-groups none --verify --atol 0.01 --rtol 0.01 --output python/sglang/srt/dynamic_sp/work/laps-validation/results.json"
+    },
+    {
+      "utc": "2026-10-27T21:53:44.811530+00:00",
+      "gpu": 3,
+      "pid": "231735",
+      "user": "vamsi",
+      "command": "/home/vamsi/src/codebase/Prefill_SP_Opt/.venv/bin/python -u -m sglang.srt.dynamic_sp --scheduler laps --laps-config python/sglang/srt/dynamic_sp/work/laps-validation/config.json --model-path python/sglang/srt/dynamic_sp/work/dp-tiny-llama --workload python/sglang/srt/dynamic_sp/work/laps-validation/workload.json --max-local-tokens 256 --max-batch-tokens 128 --execution-mode async --warmup-requests 0 --prewarm-groups none --verify --atol 0.01 --rtol 0.01 --output python/sglang/srt/dynamic_sp/work/laps-validation/results.json"
+    },
+    {
+      "utc": "2026-10-27T21:54:21.374716+00:00",
+      "gpu": 2,
+      "pid": "232636",
+      "user": "vamsi",
+      "command": "/home/vamsi/src/codebase/Prefill_SP_Opt/.venv/bin/python -u -m sglang.srt.dynamic_sp --dtype bfloat16 --scheduler laps --laps-config python/sglang/srt/dynamic_sp/work/laps-validation/config.json --model-path python/sglang/srt/dynamic_sp/work/dp-tiny-llama --workload python/sglang/srt/dynamic_sp/work/laps-validation/workload.json --max-local-tokens 256 --max-batch-tokens 128 --execution-mode async --warmup-requests 0 --prewarm-groups none --verify --atol 0.01 --rtol 0.01 --output python/sglang/srt/dynamic_sp/work/laps-validation/results.json"
+    },
+    {
+      "utc": "2026-10-27T21:54:21.374716+00:00",
+      "gpu": 3,
+      "pid": "232637",
+      "user": "vamsi",
+      "command": "/home/vamsi/src/codebase/Prefill_SP_Opt/.venv/bin/python -u -m sglang.srt.dynamic_sp --dtype bfloat16 --scheduler laps --laps-config python/sglang/srt/dynamic_sp/work/laps-validation/config.json --model-path python/sglang/srt/dynamic_sp/work/dp-tiny-llama --workload python/sglang/srt/dynamic_sp/work/laps-validation/workload.json --max-local-tokens 256 --max-batch-tokens 128 --execution-mode async --warmup-requests 0 --prewarm-groups none --verify --atol 0.01 --rtol 0.01 --output python/sglang/srt/dynamic_sp/work/laps-validation/results.json"
+    },
+    {
+      "utc": "2026-10-27T21:54:26.588080+00:00",
+      "gpu": 2,
+      "pid": "232636",
+      "user": "vamsi",
+      "command": "/home/vamsi/src/codebase/Prefill_SP_Opt/.venv/bin/python -u -m sglang.srt.dynamic_sp --dtype bfloat16 --scheduler laps --laps-config python/sglang/srt/dynamic_sp/work/laps-validation/config.json --model-path python/sglang/srt/dynamic_sp/work/dp-tiny-llama --workload python/sglang/srt/dynamic_sp/work/laps-validation/workload.json --max-local-tokens 256 --max-batch-tokens 128 --execution-mode async --warmup-requests 0 --prewarm-groups none --verify --atol 0.01 --rtol 0.01 --output python/sglang/srt/dynamic_sp/work/laps-validation/results.json"
+    },
+    {
+      "utc": "2026-10-27T21:54:26.588080+00:00",
+      "gpu": 3,
+      "pid": "232637",
+      "user": "vamsi",
+      "command": "/home/vamsi/src/codebase/Prefill_SP_Opt/.venv/bin/python -u -m sglang.srt.dynamic_sp --dtype bfloat16 --scheduler laps --laps-config python/sglang/srt/dynamic_sp/work/laps-validation/config.json --model-path python/sglang/srt/dynamic_sp/work/dp-tiny-llama --workload python/sglang/srt/dynamic_sp/work/laps-validation/workload.json --max-local-tokens 256 --max-batch-tokens 128 --execution-mode async --warmup-requests 0 --prewarm-groups none --verify --atol 0.01 --rtol 0.01 --output python/sglang/srt/dynamic_sp/work/laps-validation/results.json"
+    },
+    {
+      "utc": "2026-10-27T21:55:44.657399+00:00",
+      "gpu": 2,
+      "pid": "235312",
+      "user": "vamsi",
+      "command": "/home/vamsi/src/codebase/Prefill_SP_Opt/.venv/bin/python -u -m sglang.srt.dynamic_sp --dtype bfloat16 --scheduler laps --laps-config python/sglang/srt/dynamic_sp/work/laps-validation/config.json --model-path python/sglang/srt/dynamic_sp/work/dp-tiny-llama --workload python/sglang/srt/dynamic_sp/work/laps-validation/workload.json --max-local-tokens 256 --max-batch-tokens 128 --execution-mode async --warmup-requests 0 --prewarm-groups none --verify --atol 0.01 --rtol 0.01 --output python/sglang/srt/dynamic_sp/work/laps-validation/results.json"
+    },
+    {
+      "utc": "2026-10-27T21:55:44.657399+00:00",
+      "gpu": 3,
+      "pid": "235313",
+      "user": "vamsi",
+      "command": "/home/vamsi/src/codebase/Prefill_SP_Opt/.venv/bin/python -u -m sglang.srt.dynamic_sp --dtype bfloat16 --scheduler laps --laps-config python/sglang/srt/dynamic_sp/work/laps-validation/config.json --model-path python/sglang/srt/dynamic_sp/work/dp-tiny-llama --workload python/sglang/srt/dynamic_sp/work/laps-validation/workload.json --max-local-tokens 256 --max-batch-tokens 128 --execution-mode async --warmup-requests 0 --prewarm-groups none --verify --atol 0.01 --rtol 0.01 --output python/sglang/srt/dynamic_sp/work/laps-validation/results.json"
+    },
+    {
+      "utc": "2026-10-27T21:55:49.872358+00:00",
+      "gpu": 2,
+      "pid": "235312",
+      "user": "vamsi",
+      "command": "/home/vamsi/src/codebase/Prefill_SP_Opt/.venv/bin/python -u -m sglang.srt.dynamic_sp --dtype bfloat16 --scheduler laps --laps-config python/sglang/srt/dynamic_sp/work/laps-validation/config.json --model-path python/sglang/srt/dynamic_sp/work/dp-tiny-llama --workload python/sglang/srt/dynamic_sp/work/laps-validation/workload.json --max-local-tokens 256 --max-batch-tokens 128 --execution-mode async --warmup-requests 0 --prewarm-groups none --verify --atol 0.01 --rtol 0.01 --output python/sglang/srt/dynamic_sp/work/laps-validation/results.json"
+    },
+    {
+      "utc": "2026-10-27T21:55:49.872358+00:00",
+      "gpu": 3,
+      "pid": "235313",
+      "user": "vamsi",
+      "command": "/home/vamsi/src/codebase/Prefill_SP_Opt/.venv/bin/python -u -m sglang.srt.dynamic_sp --dtype bfloat16 --scheduler laps --laps-config python/sglang/srt/dynamic_sp/work/laps-validation/config.json --model-path python/sglang/srt/dynamic_sp/work/dp-tiny-llama --workload python/sglang/srt/dynamic_sp/work/laps-validation/workload.json --max-local-tokens 256 --max-batch-tokens 128 --execution-mode async --warmup-requests 0 --prewarm-groups none --verify --atol 0.01 --rtol 0.01 --output python/sglang/srt/dynamic_sp/work/laps-validation/results.json"
+    },
+    {
+      "utc": "2026-10-27T21:55:55.106327+00:00",
+      "gpu": 3,
+      "pid": "235313",
+      "user": "vamsi",
+      "command": "[python]"
+    }
+  ],
+  "unknown_owners": [],
+  "other_gpu_activity": [
+    {
+      "utc": "2026-10-27T21:51:14.246839+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:51:19.390322+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:51:24.534384+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:51:29.678193+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:51:34.822755+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:51:40.020121+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:51:45.223009+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:51:50.425161+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:51:55.628379+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:52:00.833234+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:52:06.036237+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:52:11.242462+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:52:16.452880+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:52:21.670794+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:52:26.904532+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:52:32.128648+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:52:37.355394+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:52:42.585168+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:52:47.814532+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:52:52.962232+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:52:58.106884+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:53:03.250437+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:53:08.394930+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:53:13.591845+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:53:18.793348+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:53:23.997844+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:53:29.199638+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:53:34.403799+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:53:39.604857+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:53:44.811530+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:53:50.022798+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:53:55.252665+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:54:00.475797+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:54:05.699190+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:54:10.931302+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:54:16.159355+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:54:21.374716+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:54:26.588080+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:54:31.867433+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:54:37.012448+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:54:42.157753+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:54:47.356766+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:54:52.561044+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:54:57.763970+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:55:02.965379+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:55:08.166866+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:55:13.369398+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:55:18.580638+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:55:23.794893+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:55:29.012190+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:55:34.223812+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:55:39.444739+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:55:44.657399+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:55:49.872358+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:55:55.106327+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:56:00.353986+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:56:05.591762+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:56:10.818374+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    },
+    {
+      "utc": "2026-10-27T21:56:16.057631+00:00",
+      "gpu": 1,
+      "memory": "0 MiB",
+      "utilization": "100 %"
+    }
+  ],
+  "errors": []
+}

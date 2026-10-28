@@ -1,0 +1,5 @@
+Upstream: https://github.com/Jianshu-She/LAPS
+Base commit: 88b986375b531b2f09261b9f44628a24a9c0d6d7
+Apply from the PLAserve root after checking out that commit into vendor/LAPS:
+  git -C vendor/LAPS checkout 88b986375b531b2f09261b9f44628a24a9c0d6d7
+  git -C vendor/LAPS apply ../../patches/laps-blackwell-vendor.diff

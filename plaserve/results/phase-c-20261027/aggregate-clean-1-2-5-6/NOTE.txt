@@ -1,0 +1,2 @@
+Repeats 1, 2, 5 and 6 had no other users on GPUs 2-5 during measurement. Repeat 5's one unknown-owner sample (GPU 5, PID 266789, 18:53:26 local) came 2 s after its last test finished, during server shutdown.
+Repeat 6 had no other-user or unknown-owner samples.

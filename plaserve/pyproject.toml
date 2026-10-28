@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "PLAserve"
+version = "0.1.0"
+description = "PLAserve: paper scheduler recreation and cluster GPU reproduction"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+plaserve = "plaserve.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["plaserve*"]

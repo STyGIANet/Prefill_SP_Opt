@@ -1,0 +1,18 @@
+{
+  "flashinfer": "0.6.3",
+  "mode": "saturating",
+  "original_header": "/home/apal/miniconda3/envs/plaserve/lib/python3.12/site-packages/flashinfer/data/include/flashinfer/attention/prefill.cuh",
+  "original_sha256": "30375ad157ffd9532256f60c6c9a487fc8553a40cbab4dbf409d3b7759172c8f",
+  "selected_sha256": "4fbcdb8047818859e0b03b28683307016ef89aa441f1df52c970cbde1d916d87",
+  "replacement_counts": [
+    2,
+    1,
+    4,
+    1
+  ],
+  "include": "/home/apal/prefill-optimization/PLAserve/results/flashinfer-mask-experiment/saturating-4fbcdb804781/include",
+  "jit": "/home/apal/prefill-optimization/PLAserve/results/flashinfer-mask-experiment/saturating-4fbcdb804781/cached_ops",
+  "model": "Qwen/Qwen2.5-7B",
+  "case": null,
+  "status": "passed"
+}
