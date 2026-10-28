@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CDSP request-level SP: one whole prompt per buddy-aligned block sized by length."""
 
+import dataclasses
 import math
 
 from sglang.srt.dynamic_sp.plan import PrefillPlan, PromptStep, local_positions
@@ -155,36 +156,47 @@ class RequestSpScheduler:
 
 
 class DynamicBatchScheduler:
-    """Windowed shortest-first prefill in compute-bound steps of step_tokens.
+    """Windowed shortest-first prefill, timed by profiled latency per SP degree.
 
     Every window_seconds the pending prompts are sorted by length. Prompts shorter
     than step_tokens are packed into groups of at most step_tokens and each group
-    runs on one GPU; every longer prompt gets the shallowest GPU group that takes
-    as many steps as the widest group left for it. Planned units start in order;
-    while the head waits for GPUs, idle GPUs run the shortest pending units that
-    end before it can start. Prompts taking more than long_steps steps run one step
-    per operation and may pause for queued short groups, in total at most
-    preempt_ratio of their own duration and never k steps in a row.
+    runs on one GPU; every longer prompt gets the profiled SP degree that finishes
+    it first, the fewest GPUs on a tie. Planned units start in order, a unit
+    shrinking to the free GPUs when that finishes no later. While the head waits
+    for GPUs, the idle GPUs run the shortest prompts queued behind it or waiting
+    for the window, regrouped the same way for those GPUs, that end before it can
+    start; with no head waiting, arrivals are queued once a GPU idles. Prompts
+    taking more than long_steps chunks of step_tokens per GPU run one chunk per
+    operation and may pause, lending their GPUs to as many queued units as end
+    within the remaining pause budget: in total at most preempt_ratio of their own
+    duration, and never k operations in a row.
     """
 
     def __init__(
         self,
         config,
-        step_seconds,
+        models,
         window_seconds=2.0,
         step_tokens=256,
         long_steps=4,
         resume_every_steps=2,
         preempt_ratio=0.2,
     ):
-        if not step_seconds > 0 or not window_seconds > 0:
-            raise ValueError("step_seconds and window_seconds must be positive")
+        if not window_seconds > 0:
+            raise ValueError("window_seconds must be positive")
         if step_tokens <= 0 or long_steps <= 0 or resume_every_steps < 1:
             raise ValueError("Need positive step_tokens and long_steps, and k >= 1")
         if not 0 <= preempt_ratio < 1:
             raise ValueError("preempt_ratio must lie in [0, 1)")
+        # Only profiled degrees are planned; a group never spans more GPUs.
+        self.models = {
+            degree: model
+            for degree, model in sorted(models.items())
+            if degree <= config.world_size
+        }
+        if 1 not in self.models:
+            raise ValueError("Dynamic SP needs a profiled SP=1 latency model")
         self.config = config
-        self.step_seconds = step_seconds
         self.window_seconds = window_seconds
         self.step_tokens = step_tokens
         self.long_steps = long_steps
@@ -197,16 +209,22 @@ class DynamicBatchScheduler:
         self.last_decision = {}
 
     @classmethod
-    def from_profile(cls, config, profile, step_tokens=256, **kwargs):
-        """Step time is the profiled single-GPU prefill of step_tokens tokens."""
+    def from_profile(cls, config, profile, **kwargs):
+        """Latency models per SP degree from a Tetris profile."""
         from sglang.srt.dynamic_sp.tetris import LatencyModel
 
-        step_seconds = LatencyModel(**profile["models"]["1"]).seconds(0, step_tokens)
-        return cls(config, step_seconds, step_tokens=step_tokens, **kwargs)
+        models = {
+            int(degree): LatencyModel(**values)
+            for degree, values in profile["models"].items()
+        }
+        return cls(config, models, **kwargs)
 
     def metadata(self):
         return {
-            "step_seconds": self.step_seconds,
+            "models": {
+                degree: dataclasses.asdict(model)
+                for degree, model in self.models.items()
+            },
             "window_seconds": self.window_seconds,
             "step_tokens": self.step_tokens,
             "long_steps": self.long_steps,
@@ -218,59 +236,64 @@ class DynamicBatchScheduler:
     def estimate_operation_seconds(self, plan):
         groups = {}
         for s in plan.steps:
-            new = s.end - self.ends.get(s.request_id, 0)
-            groups.setdefault(frozenset(s.ranks), []).append(new)
+            history = self.ends.get(s.request_id, 0)
+            groups.setdefault(s.ranks, []).append((history, s.end - history))
         return max(
-            (
-                self._steps(math.ceil(sum(tokens) / len(ranks))) * self.step_seconds
-                for ranks, tokens in groups.items()
-            ),
+            (self._seconds(len(ranks), pieces) for ranks, pieces in groups.items()),
             default=0.0,
         )
 
     def next_plan(self, state):
-        c = self.config
+        config = self.config
         now = state.now
         busy = set(state.busy_ranks)
-        views = {r.prompt.request_id: r for r in state.requests}
-        self.ends = {rid: r.end for rid, r in views.items()}
+        requests = {request.prompt.request_id: request for request in state.requests}
+        self.ends = {
+            request_id: request.end for request_id, request in requests.items()
+        }
         self.longs = {
-            rid: info
-            for rid, info in self.longs.items()
-            if rid in views and not views[rid].complete
+            request_id: info
+            for request_id, info in self.longs.items()
+            if request_id in requests and not requests[request_id].complete
         }
         release = tuple(
-            rid
-            for rid, r in views.items()
-            if r.complete and not r.in_flight and not busy.intersection(r.ranks)
+            request_id
+            for request_id, request in requests.items()
+            if request.complete
+            and not request.in_flight
+            and not busy.intersection(request.ranks)
         )
-        kv = [0] * c.world_size
+        kv_tokens = [0] * config.world_size
         held = set()
-        for rid, r in views.items():
-            if not r.ranks or rid in release:
+        for request_id, request in requests.items():
+            if not request.ranks or request_id in release:
                 continue
-            for rank in r.ranks:
-                kv[rank] += self._kv(len(r.prompt.token_ids), r.ranks, rank)
-            if not r.complete or r.in_flight:
-                held.update(r.ranks)
-        free = sorted(set(range(c.world_size)) - busy - held)
+            length = len(request.prompt.token_ids)
+            for rank in request.ranks:
+                kv_tokens[rank] += self._kv(length, request.ranks, rank)
+            if not request.complete or request.in_flight:
+                held.update(request.ranks)
+        free = sorted(set(range(config.world_size)) - busy - held)
         ready = [
-            r
-            for r in views.values()
-            if r.ranks
-            and not r.complete
-            and not r.in_flight
-            and not busy.intersection(r.ranks)
+            request
+            for request in requests.values()
+            if request.ranks
+            and not request.complete
+            and not request.in_flight
+            and not busy.intersection(request.ranks)
         ]
         pending = {
-            rid: r
-            for rid, r in views.items()
-            if not r.ranks and not r.in_flight and not r.complete
+            request_id: request
+            for request_id, request in requests.items()
+            if not request.ranks and not request.in_flight and not request.complete
         }
-        for r in pending.values():
-            if len(r.prompt.token_ids) > c.world_size * c.max_local_tokens:
+        for request in pending.values():
+            if (
+                len(request.prompt.token_ids)
+                > config.world_size * config.max_local_tokens
+            ):
                 raise ValueError(
-                    f"Prompt {r.prompt.request_id} exceeds aggregate KV capacity"
+                    f"Prompt {request.prompt.request_id} exceeds aggregate KV capacity"
                 )
         fresh = self._plan_window(pending, now)
         free_at = self._free_at(free, ready, state, now)
@@ -279,48 +302,65 @@ class DynamicBatchScheduler:
         head_start = None
 
         def launch(unit):
-            if not self._start(unit, free, kv, steps, admit):
+            if not self._start(unit, free, kv_tokens, steps, admit):
                 return False
-            finish = now + self._unit_steps(unit) * self.step_seconds
+            finish = now + self._unit_seconds(unit)
             for rank in unit["ranks"]:
                 free_at[rank] = finish
             started.append(unit)
             return True
 
-        for unit in self.queue:
-            if head_start is None and not launch(unit):
+        while True:
+            for index, unit in enumerate(self.queue):
+                if "ranks" in unit or launch(unit):
+                    continue
                 head_start = sorted(free_at)[unit["size"] - 1]
-                if self._reshape(unit, len(free), now, head_start) and launch(unit):
+                shrunk = self._reshape(unit, len(free), now, head_start)
+                if shrunk and launch(unit):
                     head_start = None
-            elif head_start is not None and self._ends_by(unit, now, head_start):
-                launch(unit)
-        # Idle GPUs take the shortest new arrivals that fit before the waiting head.
-        waiting = [u for u in self.queue if u["size"] == 1 and "ranks" not in u]
-        # Size by every GPU, not the momentarily free ones, or a long prompt is pinned narrow.
-        for unit in self._units(fresh, self.config.world_size):
-            started_now = free and self._ends_by(unit, now, head_start) and launch(unit)
-            if not started_now and unit["size"] == 1:
-                waiting.append(unit)
-        paused = self._run_longs(ready, waiting, kv, steps, admit, started)
-        self.queue = [u for u in self.queue if "ranks" not in u]
+                    continue
+                behind = self.queue[index + 1 :]
+                self._backfill(behind, fresh, free, now, head_start, launch)
+                break
+            else:
+                if fresh and free:
+                    # No head is blocked and a GPU idles: queue arrivals now, sized
+                    # by every GPU as at a window boundary. While every GPU works,
+                    # arrivals are held, then queued shortest-first together.
+                    self.queue += self._units(fresh, config.world_size)
+                    fresh = []
+                    continue
+            break
+        # Paused long prompts lend to queued units and held arrivals alike,
+        # shortest first; units built from held arrivals are dropped if not lent.
+        launched = {r.prompt.request_id for unit in started for r in unit["requests"]}
+        fresh = [r for r in fresh if r.prompt.request_id not in launched]
+        waiting = sorted(
+            [unit for unit in self.queue if "ranks" not in unit]
+            + self._units(fresh, config.world_size),
+            key=lambda unit: unit["tokens"],
+        )
+        paused = self._run_longs(ready, waiting, kv_tokens, steps, admit, started)
+        self.queue = [unit for unit in self.queue if "ranks" not in unit]
 
         self.last_decision = {
             "version": state.version,
             "started": [
                 {
-                    "requests": [r.prompt.request_id for r in u["requests"]],
-                    "tokens": u["tokens"],
-                    "ranks": u.get("ranks"),
-                    "lent_by": u.get("lent_by"),
+                    "requests": [r.prompt.request_id for r in unit["requests"]],
+                    "tokens": unit["tokens"],
+                    "ranks": unit.get("ranks"),
+                    "lent_by": unit.get("lent_by"),
                 }
-                for u in started
+                for unit in started
             ],
             "paused": paused,
-            "queued": sum(len(u["requests"]) for u in self.queue),
+            "queued": sum(len(unit["requests"]) for unit in self.queue),
             "head_start": head_start,
         }
         if not steps and not release:
-            if busy or held or not pending:
+            # Arrivals behind a blocked head are waiting for the window boundary.
+            if busy or held or not self.queue:
                 return None
             raise RuntimeError(
                 "No unit fits the configured KV capacity; scheduler made no progress"
@@ -328,7 +368,8 @@ class DynamicBatchScheduler:
         return PrefillPlan(state.version, tuple(steps), tuple(admit), release)
 
     def _plan_window(self, pending, now):
-        """At a window boundary, queue every unplanned prompt; return the unplanned rest."""
+        """At a window boundary, queue every unplanned prompt; inside a window,
+        return the arrivals waiting for its end."""
         queued = {r.prompt.request_id for u in self.queue for r in u["requests"]}
         self.queue = [
             u
@@ -341,9 +382,9 @@ class DynamicBatchScheduler:
         if now < self.window_end:
             return fresh
         self.window_end = now + self.window_seconds
-        groups = sum(1 for u in self._units(fresh, 1) if u["size"] == 1)
-        gpus = self.config.world_size - min(groups, self.config.world_size)
-        self.queue += self._units(fresh, gpus or self.config.world_size)
+        # Size by every GPU, the fastest TTFT; launch shrinks a unit to the free
+        # GPUs when that finishes no later.
+        self.queue += self._units(fresh, self.config.world_size)
         return []
 
     def _units(self, requests, gpus):
@@ -352,10 +393,7 @@ class DynamicBatchScheduler:
         units, group = [], []
         for r in sorted(requests, key=lambda r: (length(r), r.submitted_at)):
             if length(r) >= self.step_tokens:
-                steps = self._steps(length(r))
-                widest = max(1, min(steps, gpus))
-                # Shallowest group that still finishes in the widest group's steps.
-                size = math.ceil(steps / self._steps_on(steps, widest))
+                size = self._size(length(r), gpus)
                 units.append({"requests": [r], "tokens": length(r), "size": size})
             elif group and sum(map(length, group)) + length(r) > self.step_tokens:
                 units.append(self._group(group))
@@ -367,14 +405,41 @@ class DynamicBatchScheduler:
         units.sort(key=lambda u: u["tokens"])
         return units
 
+    def _backfill(self, behind, fresh, free, now, head_start, launch):
+        """Fill the GPUs idle until the blocked head starts with the shortest prompts
+        queued behind it or waiting for the window, regrouped for those GPUs, that
+        end before it starts."""
+        requests = [r for u in behind for r in u["requests"]] + fresh
+        moved = set()
+        while free:
+            # Regroup after every launch, since each one leaves fewer idle GPUs.
+            unit = next(
+                (
+                    u
+                    for u in self._units(requests, len(free))
+                    if self._ends_by(u, now, head_start) and launch(u)
+                ),
+                None,
+            )
+            if unit is None:
+                break
+            ids = {r.prompt.request_id for r in unit["requests"]}
+            moved |= ids
+            requests = [r for r in requests if r.prompt.request_id not in ids]
+        for u in behind:
+            u["requests"] = [
+                r for r in u["requests"] if r.prompt.request_id not in moved
+            ]
+            u["tokens"] = sum(len(r.prompt.token_ids) for r in u["requests"])
+        self.queue = [u for u in self.queue if u["requests"]]
+
     def _reshape(self, unit, gpus, now, head_start):
         """Shrink a blocked prompt to the free GPUs when that finishes no later."""
         if not gpus or unit["tokens"] < self.step_tokens:
             return False
-        steps = self._steps(unit["tokens"])
-        size = math.ceil(steps / self._steps_on(steps, min(steps, gpus)))
-        waited = head_start + self._unit_steps(unit) * self.step_seconds
-        if now + self._steps_on(steps, size) * self.step_seconds > waited:
+        size = self._size(unit["tokens"], gpus)
+        waited = head_start + self._unit_seconds(unit)
+        if now + self._unit_seconds(unit, size) > waited:
             return False
         unit["size"] = size
         return True
@@ -389,10 +454,8 @@ class DynamicBatchScheduler:
         for rank in free:
             free_at[rank] = now
         for r in ready:
-            left = len(r.prompt.token_ids) - r.end
-            finish = now + self._steps_on(self._steps(left), len(r.ranks)) * (
-                self.step_seconds
-            )
+            length = len(r.prompt.token_ids)
+            finish = now + self._chunked_seconds(length, len(r.ranks), r.end)
             for rank in r.ranks:
                 free_at[rank] = max(free_at[rank], finish)
         return free_at
@@ -400,8 +463,7 @@ class DynamicBatchScheduler:
     def _ends_by(self, unit, now, deadline):
         if deadline is None:
             return True
-        seconds = self._unit_steps(unit) * self.step_seconds
-        return now + seconds <= deadline
+        return now + self._unit_seconds(unit) <= deadline
 
     def _start(self, unit, free, kv, steps, admit, ranks=None):
         """Launch unit on the lowest free ranks (or the given ranks) if it fits."""
@@ -415,7 +477,7 @@ class DynamicBatchScheduler:
             if rank in free:
                 free.remove(rank)
         unit["ranks"] = ranks
-        preemptible = self._unit_steps(unit) > self.long_steps
+        preemptible = self._preemptible(unit)
         for owners, r in self._owners(unit["requests"], ranks):
             length = len(r.prompt.token_ids)
             for rank in owners:
@@ -426,9 +488,7 @@ class DynamicBatchScheduler:
                 end = min(length, chunk)
                 self.longs[r.prompt.request_id] = {
                     "chunk": chunk,
-                    "budget": self.preempt_ratio
-                    * self._unit_steps(unit)
-                    * self.step_seconds,
+                    "budget": self.preempt_ratio * self._unit_seconds(unit),
                     "paused": 0,
                 }
             steps.append(PromptStep(r.prompt.request_id, owners, end))
@@ -436,45 +496,92 @@ class DynamicBatchScheduler:
         return True
 
     def _run_longs(self, ready, waiting, kv, steps, admit, started):
-        """Advance long prompts one step, or pause them for waiting short groups."""
+        """Advance long prompts one chunk, or pause them to lend their GPUs."""
         paused = []
         for r in ready:
             rid = r.prompt.request_id
             info = self.longs.get(rid)
             if info is None:
                 continue
-            can_pause = (
-                info["paused"] < self.resume_every_steps - 1
-                and info["budget"] >= self.step_seconds
-            )
-            lent = []
-            for rank in r.ranks if can_pause else ():
-                while waiting:
-                    unit = waiting.pop(0)
-                    if self._start(unit, [], kv, steps, admit, ranks=(rank,)):
-                        unit["lent_by"] = rid
-                        started.append(unit)
-                        lent.append(rank)
-                        break
-            if lent:
-                info["paused"] += 1
-                info["budget"] -= self.step_seconds
-                paused.append(rid)
-                continue
+            if info["paused"] < self.resume_every_steps - 1:
+                pause = self._lend(
+                    rid, r.ranks, info["budget"], waiting, kv, steps, admit, started
+                )
+                if pause:
+                    info["paused"] += 1
+                    info["budget"] -= pause
+                    paused.append(rid)
+                    continue
             info["paused"] = 0
             end = min(len(r.prompt.token_ids), r.end + info["chunk"])
             steps.append(PromptStep(rid, r.ranks, end))
         return paused
 
-    def _steps(self, tokens):
-        return max(1, math.ceil(tokens / self.step_tokens))
+    def _lend(self, lender, ranks, budget, waiting, kv, steps, admit, started):
+        """Start the shortest queued units on the lender's GPUs, as many as fit,
+        each ending within budget and never chunked; return the pause length."""
+        spare = list(ranks)
+        pause = 0.0
+        for unit in list(waiting):
+            if not spare:
+                break
+            size = unit["size"]
+            if unit["tokens"] >= self.step_tokens:
+                size = self._size(unit["tokens"], len(spare))
+            if size > len(spare):
+                continue
+            seconds = self._unit_seconds(unit, size)
+            if seconds > budget or self._preemptible(unit, size):
+                continue
+            original, unit["size"] = unit["size"], size
+            if not self._start(unit, [], kv, steps, admit, ranks=tuple(spare[:size])):
+                unit["size"] = original
+                continue
+            unit["lent_by"] = lender
+            started.append(unit)
+            waiting.remove(unit)
+            spare = spare[size:]
+            pause = max(pause, seconds)
+        return pause
 
-    @staticmethod
-    def _steps_on(steps, gpus):
-        return math.ceil(steps / gpus)
+    def _seconds(self, size, pieces):
+        """Profiled latency of one operation; pieces are (history, new tokens)."""
+        model = self.models[size]
+        return model.a + sum(
+            (model.b + model.c * history) * tokens + model.d * tokens * tokens
+            for history, tokens in pieces
+        )
 
-    def _unit_steps(self, unit):
-        return self._steps_on(self._steps(unit["tokens"]), unit["size"])
+    def _chunked_seconds(self, length, size, start):
+        """Prefill of one prompt from start, one chunk per operation."""
+        chunk = self.step_tokens * size
+        return sum(
+            self._seconds(size, [(begin, min(chunk, length - begin))])
+            for begin in range(start, length, chunk)
+        )
+
+    def _preemptible(self, unit, size=None):
+        size = size or unit["size"]
+        chunks = math.ceil(unit["tokens"] / (self.step_tokens * size))
+        return len(unit["requests"]) == 1 and chunks > self.long_steps
+
+    def _unit_seconds(self, unit, size=None):
+        size = size or unit["size"]
+        if len(unit["requests"]) == 1:
+            return self._prompt_seconds(unit["tokens"], size)
+        lengths = [len(r.prompt.token_ids) for r in unit["requests"]]
+        return self._seconds(size, [(0, length) for length in lengths])
+
+    def _prompt_seconds(self, length, size):
+        if math.ceil(length / (self.step_tokens * size)) > self.long_steps:
+            return self._chunked_seconds(length, size, 0)
+        return self._seconds(size, [(0, length)])
+
+    def _size(self, length, gpus):
+        """Profiled degree within gpus that finishes the prompt first, fewest GPUs
+        on a tie."""
+        degrees = [d for d in self.models if d <= max(1, gpus)]
+        return min(degrees, key=lambda d: (self._prompt_seconds(length, d), d))
 
     def _fits(self, batch, ranks, kv):
         extra = [0] * self.config.world_size

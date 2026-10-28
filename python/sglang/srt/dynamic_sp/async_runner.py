@@ -167,6 +167,7 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
     first_arrival = None
     peak_rate = 0.0
     last_reported_completed = -1
+    stalled_since = None
     total_prompts = len(arrivals) if plans is None else sum(len(p.admit) for p in plans)
     try:
         while True:
@@ -393,11 +394,18 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
                 source.exhausted if source is not None else replay_index == len(plans)
             )
             if exhausted and not executor.inflight and (decode is None or decode.idle):
-                if source is not None and driver.requests:
+                if source is None or not driver.requests:
+                    break
+                # A windowed policy may hold arrivals on idle workers until its
+                # next boundary, so only a stall longer than the timeout is an error.
+                if stalled_since is None:
+                    stalled_since = now
+                elif now - stalled_since > args.async_timeout:
                     raise RuntimeError(
                         "Async policy made no progress with pending requests and no leased workers"
                     )
-                break
+            else:
+                stalled_since = None
             # No global barrier: every poll processes whichever group completes.
             # Arrivals are drained at most 1 ms later while GPUs remain active.
             time.sleep(0.001)

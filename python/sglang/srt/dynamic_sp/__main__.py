@@ -185,31 +185,26 @@ def main():
     # Tetris Implementation
     parser.add_argument(
         "--dynamic-profile",
-        help="Latency profile (Tetris profile JSON) for --scheduler dynamic predictions",
-    )
-    parser.add_argument(
-        "--step-seconds",
-        type=float,
-        help="Seconds per compute-bound step for --scheduler dynamic (default: from --dynamic-profile)",
+        help="Tetris profile JSON whose per-SP-degree latency models time --scheduler dynamic",
     )
     parser.add_argument("--window-seconds", type=float, default=2.0)
     parser.add_argument(
         "--step-tokens",
         type=int,
         default=256,
-        help="Tokens one GPU prefills in one compute-bound step",
+        help="Tokens per one-GPU group of short prompts, and per GPU in each chunk of a long prompt",
     )
     parser.add_argument(
         "--long-steps",
         type=int,
         default=4,
-        help="Prompts taking more steps than this run one step at a time and are preemptible",
+        help="Prompts taking more chunks than this run one chunk per operation and are preemptible",
     )
     parser.add_argument(
         "--resume-every-steps",
         type=int,
         default=2,
-        help="A preempted long prompt runs at least once every k steps",
+        help="A preempted long prompt runs at least once every k of its operations",
     )
     parser.add_argument(
         "--preempt-ratio",
@@ -334,12 +329,8 @@ def main():
         parser.error("tolerances must be finite and nonnegative")
     if args.scheduler == "tetris" and not args.tetris_profile and not args.schedule:
         parser.error("--scheduler tetris requires --tetris-profile")
-    if (
-        args.scheduler == "dynamic"
-        and not (args.dynamic_profile or args.step_seconds)
-        and not args.schedule
-    ):
-        parser.error("--scheduler dynamic requires --dynamic-profile or --step-seconds")
+    if args.scheduler == "dynamic" and not args.dynamic_profile and not args.schedule:
+        parser.error("--scheduler dynamic requires --dynamic-profile")
     if args.scheduler == "loongserve":
         if not args.loongserve_profile and not args.schedule:
             parser.error("--scheduler loongserve requires --loongserve-profile")
@@ -433,16 +424,11 @@ def main():
                     "resume_every_steps": args.resume_every_steps,
                     "preempt_ratio": args.preempt_ratio,
                 }
-                if args.step_seconds:
-                    policy = DynamicBatchScheduler(
-                        config, step_seconds=args.step_seconds, **options
-                    )
-                else:
-                    policy = DynamicBatchScheduler.from_profile(
-                        config,
-                        json.loads(Path(args.dynamic_profile).read_text()),
-                        **options,
-                    )
+                policy = DynamicBatchScheduler.from_profile(
+                    config,
+                    json.loads(Path(args.dynamic_profile).read_text()),
+                    **options,
+                )
             elif args.scheduler in ("tetris", "loongserve"):
                 if args.scheduler == "tetris":
                     from sglang.srt.dynamic_sp.tetris import TetrisScheduler
