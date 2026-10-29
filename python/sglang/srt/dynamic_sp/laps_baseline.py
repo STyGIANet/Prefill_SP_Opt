@@ -171,6 +171,7 @@ def main():
     parser.add_argument("--warmup-tokens", type=int, default=8192)
     parser.add_argument("--progress-interval", type=float, default=10)
     parser.add_argument("--progress-throughput-target", type=float, default=0)
+    parser.add_argument("--gpus", type=int, default=8, help="GPUs 0..N-1 to serve on")
     args = parser.parse_args()
     config = read_config(args.laps_config)
     if (
@@ -229,7 +230,7 @@ def main():
         config["graph_token_buckets"] = [n for n in sizes if n <= args.chunk_size]
         if not config["graph_token_buckets"]:
             raise ValueError("Released piecewise graph grid requires chunk-size >= 4")
-    replicas = 8 // config["tp_size"]
+    replicas = args.gpus // config["tp_size"]
     settings = {
         "model_path": args.model_path,
         "dp_size": replicas,
@@ -274,7 +275,7 @@ def main():
         + "\n"
     )
     print(
-        f"[dynamic-sp] scheduler=laps runtime=native replicas={replicas} tp={config['tp_size']} prefill_gpus=8 graphs=laps-released attention={config['attention_backend']}",
+        f"[dynamic-sp] scheduler=laps runtime=native replicas={replicas} tp={config['tp_size']} prefill_gpus={args.gpus} graphs=laps-released attention={config['attention_backend']}",
         flush=True,
     )
     engine = Engine(**settings, cuda_graph_config=graphs)

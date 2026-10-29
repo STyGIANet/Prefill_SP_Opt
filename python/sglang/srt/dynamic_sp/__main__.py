@@ -191,12 +191,17 @@ def main():
         "--dynamic-profile",
         help="Tetris profile JSON whose per-SP-degree latency models time --scheduler dynamic",
     )
-    parser.add_argument("--window-seconds", type=float, default=2.0)
+    parser.add_argument(
+        "--window-seconds",
+        type=float,
+        default=0.006,
+        help="Dynamic: seconds between queue regroupings, the LAPS paper's 6 ms by default; 0 regroups on every call",
+    )
     parser.add_argument(
         "--step-tokens",
         type=int,
-        default=256,
-        help="Tokens per one-GPU group of short prompts, and per GPU in each chunk of a long prompt",
+        help="Tokens per one-GPU group of short prompts, and per GPU in each chunk "
+        "of a long prompt (default: min_chunk_tokens of --dynamic-profile)",
     )
     parser.add_argument(
         "--long-steps",

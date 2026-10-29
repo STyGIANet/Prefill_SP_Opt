@@ -250,7 +250,9 @@ class PiecewiseCudaGraphRunner:
                 install_torch_compiled(
                     patched_model,
                     fullgraph=True,
-                    dynamic_arg_dims=None,
+                    # Qwen3Model.forward is unannotated, so annotation inference finds no
+                    # tensors; these are the dims it infers for annotated models (Llama).
+                    dynamic_arg_dims={"input_ids": 0, "positions": -1, "input_embeds": 0},
                     compile_config=self.compile_config,
                     graph_pool=get_global_graph_memory_pool(),
                 )
