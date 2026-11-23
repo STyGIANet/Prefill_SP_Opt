@@ -1,9 +1,15 @@
+import contextlib
 import unittest
+import weakref
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    breakable_cuda_graph as bcg,
+)
 from sglang.srt.model_executor.runner_utils.forward_batch import (
     set_forward_batch,
 )
@@ -17,13 +23,12 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    SimpleNamespace,
     popen_launch_server,
 )
 
 # CI Registration — large suite to fit the integration test's server startup.
-register_cuda_ci(est_time=92, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_cuda_ci(est_time=164, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=200, suite="base-c-test-large-8-gpu-amd-mi35x")
 
 
 class TestBreakableCUDAGraphBasic(CustomTestCase):
@@ -140,6 +145,49 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         graph.replay()
         torch.cuda.synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 16.0, device=self.device)))
+
+    def test_segment_capture_wraps_every_segment(self):
+        """Memory saver mode captures through segment_capture; a segment that
+        bypasses it would keep pool memory the saver cannot pause."""
+        x = torch.zeros(4, device=self.device)
+        y = torch.zeros(4, device=self.device)
+        entered = []
+
+        @contextlib.contextmanager
+        def segment_capture(*, cuda_graph, pool, stream, capture_error_mode):
+            entered.append(cuda_graph)
+            with torch.cuda.graph(
+                cuda_graph,
+                pool=pool,
+                stream=stream,
+                capture_error_mode=capture_error_mode,
+            ):
+                yield
+
+        @self.eager_on_graph(enable=True)
+        def add_one(src, out):
+            out.copy_(src + 1.0)
+
+        graph = self.BreakableCUDAGraph()
+        stream = torch.cuda.Stream(self.device)
+        with self.BreakableCUDAGraphCapture(
+            graph,
+            pool=torch.cuda.graph_pool_handle(),
+            stream=stream,
+            segment_capture=segment_capture,
+        ):
+            t1 = x + 1.0
+            t2 = torch.empty_like(t1)
+            add_one(t1, t2)
+            y.copy_(t2 * 2.0)
+
+        self.assertEqual(len(entered), 2)
+        self.assertTrue(all(a is b for a, b in zip(entered, graph._segments)))
+        # Replay: x=5 -> +1=6 -> add_one=7 -> *2=14
+        x.fill_(5.0)
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(torch.allclose(y, torch.full((4,), 14.0, device=self.device)))
 
     def test_eager_on_graph_disabled(self):
         """@eager_on_graph(enable=False) should be a no-op passthrough."""
@@ -262,6 +310,78 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         torch.testing.assert_close(observed["out_cache_loc"], expected)
         self.assertEqual(forward_batch.positions.shape[0], padded_num_tokens)
         self.assertEqual(forward_batch.out_cache_loc.shape[0], padded_num_tokens)
+
+    def test_pool_outputs_replay_without_retaining_intermediates(self):
+        for pass_output in (False, True):
+            with self.subTest(pass_output=pass_output):
+                allocations, references, direct_writes = [], [], []
+
+                def allocate(src):
+                    self.assertTrue(torch.cuda.is_current_stream_capturing())
+                    allocations.append(1)
+                    return torch.empty_like(src), None
+
+                def compute(src, out=None):
+                    self.assertFalse(torch.cuda.is_current_stream_capturing())
+                    result = src * 2 if out is None else torch.mul(src, 2, out=out[0])
+                    return result, None
+
+                def copy_output(dst, src):
+                    if isinstance(dst, tuple):
+                        direct_writes.append(dst[0] is src[0])
+                    return original_copy(dst, src)
+
+                operation = self.eager_on_graph(
+                    compute, output_factory=allocate, pass_output=pass_output
+                )
+                x = torch.zeros(1024, device=self.device)
+                y = torch.empty_like(x)
+                self.assertTrue(torch.equal(operation(x)[0], x))
+                self.assertEqual(allocations, [])
+                graph = self.BreakableCUDAGraph()
+                original_copy = bcg._copy_into_output
+                with patch.object(bcg, "_copy_into_output", new=copy_output):
+                    with self.BreakableCUDAGraphCapture(
+                        graph, stream=torch.cuda.Stream()
+                    ):
+                        value = x + 1
+                        for _ in range(4):
+                            result, absent = operation(value)
+                            self.assertIsNone(absent)
+                            references.append(weakref.ref(result))
+                            value = result + 1
+                            del result
+                        y.copy_(value)
+                    self.assertTrue(all(ref() is None for ref in references))
+                    self.assertEqual(direct_writes, [])
+                    for n in (2, 5):
+                        x.fill_(n)
+                        graph.replay()
+                        torch.testing.assert_close(y, torch.full_like(y, 16 * n + 31))
+                self.assertEqual(len(allocations), 4)
+                self.assertEqual(direct_writes, [pass_output] * 8)
+
+    def test_output_factory_is_bypassed_by_explicit_eager_call(self):
+        class Operation:
+            @bcg.eager_on_graph(output_factory=lambda self, x: torch.empty_like(x))
+            def run(self, x):
+                return x
+
+        operation = Operation()
+        x = torch.ones(4, device=self.device)
+        with patch.object(bcg, "_current_capture_var") as capture:
+            self.assertIs(operation.run.run_eager(x), x)
+            capture.get.assert_not_called()
+        self.assertIs(operation.run(x), x)
+
+    def test_pool_output_layout_mismatch_is_rejected(self):
+        target = torch.empty(2, 4, device=self.device)
+        for result in (target[:1], target.double(), (target,), None):
+            with self.subTest(result_type=type(result)):
+                with self.assertRaisesRegex(AssertionError, "BCG output layout"):
+                    bcg._copy_into_output(target, result)
+        with self.assertRaisesRegex(AssertionError, "BCG output structure"):
+            bcg._copy_into_output((target, None), (target,))
 
 
 class TestBreakGraphHelper(CustomTestCase):
