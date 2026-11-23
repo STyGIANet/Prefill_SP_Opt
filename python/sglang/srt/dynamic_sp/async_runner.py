@@ -43,7 +43,10 @@ def run_async(args, model, control, scheduler, arrivals, plans):
     }
     prefill_world = dist.get_world_size() - args.decode_gpus
     instances = _decode_instances(args)
-    prewarm = prewarm_memberships(prefill_world, args.prewarm_groups)
+    prewarm_mode = args.prewarm_groups
+    if prewarm_mode == "auto":
+        prewarm_mode = "all" if getattr(args, "warmup_requests", 0) else "none"
+    prewarm = prewarm_memberships(prefill_world, prewarm_mode)
     if prewarm:
         # Decode TP groups, then every owner-to-instance transfer group.
         extra = set(instances) | {
@@ -68,9 +71,9 @@ def run_async(args, model, control, scheduler, arrivals, plans):
     if dist.get_rank() != 0:
         executor.serve()
         return
-    if args.prewarm_groups != "none":
+    if prewarm_mode != "none":
         print(
-            f"[dynamic-sp] prewarmed {args.prewarm_groups} groups "
+            f"[dynamic-sp] prewarmed {prewarm_mode} groups "
             f"in {time.perf_counter() - started:.1f}s",
             flush=True,
         )
@@ -82,6 +85,71 @@ def run_async(args, model, control, scheduler, arrivals, plans):
             raise ValueError(
                 "Warmup requires an online workload, not a replay schedule"
             )
+        warmup_started = time.perf_counter()
+        coverage, pass_seconds = [], []
+        if not args.decode_gpus:
+            from sglang.srt.dynamic_sp.warmup import backend_warmup_plans
+
+            backend_plans, coverage = backend_warmup_plans(
+                args, model, scheduler.policy, prefill_world
+            )
+            for repeat in range(1):
+                print(
+                    f"[dynamic-sp] backend warmup pass={repeat + 1}/1 "
+                    f"cases={len(coverage)} max_chunk={max(c['chunk_tokens'] for c in coverage)}",
+                    flush=True,
+                )
+                phase_start = time.perf_counter()
+                _run_phase(
+                    args,
+                    model,
+                    # Replay backend shapes without the measured policy's
+                    # estimator: its profile may omit degrees such as SP=3.
+                    None,
+                    [],
+                    backend_plans,
+                    executor,
+                    warmup=True,
+                )
+                executor.reset()
+                pass_seconds.append(time.perf_counter() - phase_start)
+                print(
+                    f"[dynamic-sp] backend warmup pass={repeat + 1}/1 seconds={pass_seconds[-1]:.3f}",
+                    flush=True,
+                )
+        context_coverage, context_pass_seconds = [], []
+        if not args.decode_gpus:
+            from .warmup import context_warmup_cases
+
+            longest = max((len(prompt.token_ids) for _, prompt in arrivals), default=0)
+            cases = context_warmup_cases(args, model, scheduler.policy, prefill_world, longest)
+            context_coverage = [dict(ranks=c.members, processed_tokens=c.history,
+                                     chunk_tokens=c.chunk) for c in cases]
+            print(f"[dynamic-sp] context warmup: passes=2 cases/pass={len(cases)} "
+                  f"max_processed={max((c.history for c in cases), default=0)} "
+                  f"max_chunk={max((c.chunk for c in cases), default=0)} "
+                  f"synthetic_kv=True context_cap={getattr(args, 'warmup_context_tokens', 0) or 'workload'}",
+                  flush=True)
+            for repeat in range(2):
+                phase_start = last_report = time.perf_counter()
+                for index, case in enumerate(cases):
+                    executor.submit(replace(case, ticket=-(repeat * len(cases) + index + 1)))
+                    while True:
+                        events = executor.poll(timeout=0.1)
+                        if time.perf_counter() - last_report >= 10:
+                            print(f"[dynamic-sp] context warmup pass={repeat + 1}/2 "
+                                  f"case={index + 1}/{len(cases)} SP={len(case.members)} "
+                                  f"processed={case.history} chunk={case.chunk}", flush=True)
+                            last_report = time.perf_counter()
+                        if events:
+                            if any(response["status"] != "committed"
+                                   for _, responses in events for response in responses):
+                                raise RuntimeError("Long-context warmup failed")
+                            break
+                executor.reset()
+                context_pass_seconds.append(time.perf_counter() - phase_start)
+                print(f"[dynamic-sp] context warmup pass={repeat + 1}/2 "
+                      f"seconds={context_pass_seconds[-1]:.3f}", flush=True)
         warmup = warmup_arrivals(
             arrivals, warmup_count, token_budget=getattr(args, "warmup_tokens", 8192)
         )
@@ -102,6 +170,18 @@ def run_async(args, model, control, scheduler, arrivals, plans):
                 warmup=True,
             )
             executor.reset()
+        args.backend_warmup = {
+            "cases": coverage,
+            "context_cases": context_coverage,
+            "context_pass_seconds": context_pass_seconds,
+            "context_cap_tokens": getattr(args, "warmup_context_tokens", 0),
+            "context_initialization": "synthetic_zero_KV",
+            "context_execution": "one_layer_attention" if args.attention_backend == "ring" else "full_model_chunk",
+            "passes": len(pass_seconds),
+            "pass_seconds": pass_seconds,
+            "total_seconds": time.perf_counter() - warmup_started,
+            "communicators": prewarm_mode,
+        }
         print(
             "[dynamic-sp] warmup complete; KV slots released; starting measured arrivals",
             flush=True,
@@ -413,7 +493,11 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
                 # next boundary, so only a stall longer than the timeout is an error.
                 if stalled_since is None:
                     stalled_since = now
-                elif now - stalled_since > args.async_timeout or driver.requests and getattr(policy, "wake_at", None) is not None:
+                elif (
+                    now - stalled_since > args.async_timeout
+                    or driver.requests
+                    and getattr(policy, "wake_at", None) is not None
+                ):
                     time.sleep(
                         min(0.001, max(0.0, policy.wake_at - time.perf_counter()))
                     )
@@ -445,6 +529,14 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
         if source is not None:
             source.close()
     if warmup:
+        if any(
+            metrics.get("allocator_retries", 0) or metrics.get("allocator_ooms", 0)
+            for result in results
+            for metrics in result["worker_metrics"]
+        ):
+            raise RuntimeError(
+                "Allocator retry or OOM during warmup; lower execution/KV limits"
+            )
         return
     wall = throughput_summary(timings)
     latencies = sorted(
@@ -495,6 +587,7 @@ def _run_phase(args, model, scheduler, arrivals, plans, executor, *, warmup=Fals
         ),
         "kv_storage": "native_sglang_slot_pool",
         "verification_enabled": args.verify,
+        "backend_warmup": getattr(args, "backend_warmup", None),
         "warmup_requests": min(
             getattr(args, "warmup_requests", 0),
             len(arrivals),

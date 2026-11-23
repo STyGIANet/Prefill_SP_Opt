@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 original_args=("$@")
+profile_only=0
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${VIRTUAL_ENV:-}" ]]; then
@@ -56,6 +57,8 @@ recalibrate_tetris=0
 loongserve_samples=""
 loongserve_max_prefill_seconds=""
 loongserve_calibration_lengths=""
+roofline_profile=""
+roofline_samples=""
 tetris_profile=""
 tetris_samples=""
 fit_dataset=""
@@ -109,7 +112,7 @@ Options:
   --execution-mode MODE async (default) or sync SP execution
   --max-prompt-tokens N Exclude longer records without truncation
   --laps-config PATH   Native LAPS replica/router/graph settings JSON
-  --scheduler NAME      all SP schedulers (default), greedy, request, tetris, loongserve, laps, or module:factory
+  --scheduler NAME      all SP schedulers (default), greedy, request, dynamic, spsrpt, tetris, loongserve, laps, or module:factory
   --sp-sizes LIST        Request scheduler block sizes, e.g. 1,2,4,8
   --size-thresholds LIST Request scheduler length thresholds, e.g. 256,1024,4096
   --recalibrate-loongserve  Explicitly run new GPU calibration (default: reuse compatible profile)
@@ -143,14 +146,17 @@ Options:
   --seed N              Seed for optional trace export (default: 0)
   --output-dir PATH     Fresh directory for workload, manifest, logs, and results
   --workload-dir PATH   Reuse prepared workload and manifest for a matched comparison
+  --spsrpt-profile PATH  Reuse a frozen roofline profile
+  --roofline-samples PATH    Build/reuse a profile from production-ring measurements
+  --profile-only        Resolve or fit a profile, then exit before evaluation
   --prepare-only        Prepare evaluation data only, without GPU work or fitting
   --datasets "P ..."     Dataset presets: pg19 arxiv govreport (default: all three)
   --attention-backends "B ..."  Matrix backends (default: ring gathered streaming)
   --kv-transports "T ..." Matrix transports (default: targeted all_gather)
   --repeats N           Measured trials per combination (default: 1)
   --progress-interval S Progress refresh seconds (default: 10; 0 disables)
-  --warmup-tokens N     Total sequential warmup token budget (default: 8192)
-  --warmup-requests N   Same-process warmup prompts per trial (default: 8)
+  --warmup-tokens N     Backend warmup size scale, not total tokens (default: 8192)
+  --warmup-requests N   Scheduler warmup count; 0 disables all warmup (default: 8)
   --verify              Enable reference checking; affects measured performance
   --no-verify           Disable reference checking (default)
   --verbose             Also show model-loading and library diagnostics
@@ -182,7 +188,7 @@ while (($#)); do
         --eval-length-mode) set -- --length-mode "${@:2}" ;;
     esac
     case "$1" in
-        --max-prompt-tokens|--laps-config|--loongserve-calibration-concurrency|--loongserve-calibration-grid|--loongserve-profile|--loongserve-samples|--loongserve-max-prefill-seconds|--loongserve-calibration-lengths|--progress-interval|--datasets|--attention-backends|--kv-transports|--repeats|--warmup-tokens|--warmup-requests|--tetris-fit-method|--execution-mode|--workload-dir|--python|--model|--dataset|--dataset-config|--split|--num-prompts|--input-tokens|--chunk-tokens|--max-local-tokens|--output-dir|--model-revision|--dataset-revision|--text-column|--seed|--dtype|--attention-backend|--scheduler|--max-running-requests|--max-batch-tokens|--offered-load|--arrival-seed|--arrival-pattern|--length-mode|--tetris-profile|--fit-dataset|--fit-split|--fit-dataset-config|--fit-dataset-revision|--fit-text-column|--fit-num-prompts|--fit-input-tokens|--fit-length-mode|--tetris-samples|--tetris-loads|--tetris-request-rates|--tetris-min-chunk-tokens|--tetris-chunk-solver|--tetris-objective|--tetris-simulation-requests|--kv-transport|--shared-attention|--sp-sizes|--size-thresholds)
+        --spsrpt-profile|--roofline-samples|--spsrpt-prediction-tolerance|--spsrpt-prediction-max-panels|--spsrpt-quantum|--spsrpt-migration-bandwidth|--spsrpt-migration-startup|--max-prompt-tokens|--laps-config|--loongserve-calibration-concurrency|--loongserve-calibration-grid|--loongserve-profile|--loongserve-samples|--loongserve-max-prefill-seconds|--loongserve-calibration-lengths|--progress-interval|--datasets|--attention-backends|--kv-transports|--repeats|--warmup-tokens|--warmup-requests|--tetris-fit-method|--execution-mode|--workload-dir|--python|--model|--dataset|--dataset-config|--split|--num-prompts|--input-tokens|--chunk-tokens|--max-local-tokens|--output-dir|--model-revision|--dataset-revision|--text-column|--seed|--dtype|--attention-backend|--scheduler|--max-running-requests|--max-batch-tokens|--offered-load|--arrival-seed|--arrival-pattern|--length-mode|--tetris-profile|--fit-dataset|--fit-split|--fit-dataset-config|--fit-dataset-revision|--fit-text-column|--fit-num-prompts|--fit-input-tokens|--fit-length-mode|--tetris-samples|--tetris-loads|--tetris-request-rates|--tetris-min-chunk-tokens|--tetris-chunk-solver|--tetris-objective|--tetris-simulation-requests|--kv-transport|--shared-attention|--sp-sizes|--size-thresholds)
             if (($# < 2)) || [[ -z "$2" || "$2" == --* ]]; then
                 printf 'Missing value for %s\n' "$1" >&2; exit 2
             fi
@@ -196,7 +202,9 @@ while (($#)); do
                 --loongserve-calibration-lengths) loongserve_calibration_lengths="$2" ;;
                 --datasets|--attention-backends|--kv-transports|--repeats) matrix=1 ;;
                 --progress-interval) runner_args+=(--progress-interval "$2") ;;
-                --sp-sizes|--size-thresholds) runner_args+=("$1" "$2") ;;
+                --spsrpt-profile) roofline_profile="$2" ;;
+                --roofline-samples) roofline_samples="$2" ;;
+                --spsrpt-prediction-tolerance|--spsrpt-prediction-max-panels|--spsrpt-quantum|--spsrpt-migration-bandwidth|--spsrpt-migration-startup|--sp-sizes|--size-thresholds) runner_args+=("$1" "$2") ;;
                 --warmup-tokens) warmup_tokens="$2" ;;
                 --warmup-requests) warmup_requests="$2" ;;
                 --tetris-fit-method) tetris_fit_method="$2" ;;
@@ -246,6 +254,7 @@ while (($#)); do
         --recalibrate-tetris) recalibrate_tetris=1; shift ;;
         --recalibrate-loongserve) recalibrate_loongserve=1; shift ;;
         --prepare-only) prepare_only=1; shift ;;
+        --profile-only) profile_only=1; shift ;;
         --migration-overlap|--no-migration-overlap) migration_overlap="$1"; shift ;;
         --no-verify) verify_flag="--no-verify"; shift ;;
         --verify) verify_flag="--verify"; shift ;;
@@ -407,16 +416,39 @@ if ((prepare_only)); then
     exit 0
 fi
 model_path="$("$python_bin" -c 'import json,sys; print(json.load(open(sys.argv[1]))["model_path"])' "${output_dir}/manifest.json")"
+
 # Keep all Tetris fitting inputs separate from the evaluation workload.
 run_logged() {
     local log_path="$1"
     shift
+    mkdir -p "$(dirname -- "$log_path")"
     if ! (set -o pipefail; "$@" 2>&1 | tee "$log_path" | show_logs); then
         printf 'Stage failed. Diagnostic log: %s\n' "$log_path" >&2
         tail -n 80 "$log_path" >&2
         exit 1
     fi
 }
+if [[ "$scheduler" == "spsrpt" ]]; then
+    if [[ "$dtype" != bfloat16 || "$attention_backend" != ring || "$kv_transport" != targeted || "$execution_mode" != async || "$shared_attention" != auto ]]; then
+        echo 'spsrpt requires BF16, async ring attention, targeted transport, and shared-attention auto' >&2
+        exit 2
+    fi
+    if [[ -z "$roofline_profile" ]]; then
+        roofline_profile="$output_dir/spsrpt/profile.json"
+        roofline_options=()
+        if [[ -n "$roofline_samples" ]]; then
+            roofline_options+=(--samples "$roofline_samples")
+        fi
+        run_logged "$output_dir/spsrpt/profile.log" "$python_bin" -m sglang.srt.dynamic_sp.roofline_profile \
+            --model-path "$model_path" --work-dir "$repo_root/python/sglang/srt/dynamic_sp/work" \
+            --output "$roofline_profile" "${roofline_options[@]}"
+    fi
+    runner_args+=(--spsrpt-profile "$roofline_profile")
+    if ((profile_only)); then exit 0; fi
+fi
+if ((profile_only)) && [[ "$scheduler" != tetris && "$scheduler" != loongserve ]]; then
+    printf '%s\n' "--profile-only requires tetris or loongserve" >&2; exit 2
+fi
 if [[ "$scheduler" == laps ]]; then
     if [[ "$verify_flag" == --verify ]]; then
         printf 'LAPS uses native SGLang; SP reference-logit verification is unavailable. Use --no-verify.\n' >&2
@@ -549,10 +581,12 @@ if [[ "$scheduler" == tetris ]]; then
         --profile "$tetris_profile" --evaluation-manifest "$output_dir/manifest.json"
     runner_args+=(--tetris-profile "$tetris_profile" --tetris-chunk-solver "$tetris_chunk_solver")
 fi
+if ((profile_only)); then exit 0; fi
 printf '[dynamic-sp] Loading model; full diagnostics: %s/run.log\n' "$output_dir"
 if [[ "$scheduler" == "sglang-dp" ]]; then
     if ! (set -o pipefail; "$python_bin" -m sglang.srt.dynamic_sp.dp_baseline \
         --model-path "$model_path" --dtype "$dtype" --dp-size 8 \
+        --warmup-requests "$warmup_requests" --warmup-tokens "$warmup_tokens" \
         --workload "${output_dir}/workload.json" --output "${output_dir}/results.json" \
         --chunk-size "$chunk_tokens" --max-local-tokens "$max_local_tokens" \
         --max-running-requests "$max_running_requests" --progress-throughput-target "$offered_load" "${runner_args[@]}" \

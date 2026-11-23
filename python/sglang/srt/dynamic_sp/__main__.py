@@ -125,8 +125,8 @@ def main():
     parser.add_argument("--async-timeout", type=float, default=600)
     parser.add_argument(
         "--prewarm-groups",
-        choices=("none", "contiguous", "all"),
-        default="none",
+        choices=("auto", "none", "contiguous", "all"),
+        default="auto",
         help="Build these rank groups and connect their NCCL paths before measuring",
     )
     parser.add_argument(
@@ -184,7 +184,23 @@ def main():
     parser.add_argument(
         "--scheduler",
         default="greedy",
-        help="greedy, request, dynamic, tetris, loongserve, or module:factory taking SchedulerConfig",
+        help="greedy, request, dynamic, spsrpt, tetris, loongserve, or module:factory taking SchedulerConfig",
+    )
+    parser.add_argument("--spsrpt-profile", help="Frozen stage-wise roofline profile")
+    parser.add_argument("--spsrpt-quantum", type=float, default=0.2)
+    parser.add_argument("--spsrpt-prediction-tolerance", type=float, default=0.01)
+    parser.add_argument("--spsrpt-prediction-max-panels", type=int, default=128)
+    parser.add_argument(
+        "--spsrpt-migration-bandwidth",
+        type=float,
+        default=20e9,
+        help="Estimated aggregate KV migration bytes/s",
+    )
+    parser.add_argument(
+        "--spsrpt-migration-startup",
+        type=float,
+        default=0.001,
+        help="Estimated migration startup seconds",
     )
     # Tetris Implementation
     parser.add_argument(
@@ -335,6 +351,13 @@ def main():
         parser.error("prompt-length and chunk-size must be positive")
     if any(not math.isfinite(t) or t < 0 for t in (args.atol, args.rtol)):
         parser.error("tolerances must be finite and nonnegative")
+    if args.scheduler == "spsrpt" and not args.schedule:
+        if not args.spsrpt_profile:
+            parser.error("--scheduler spsrpt requires --spsrpt-profile")
+        if (args.dtype != "bfloat16" or args.attention_backend != "ring"
+                or args.kv_transport != "targeted" or args.shared_attention != "auto"
+                or args.execution_mode != "async"):
+            parser.error("spsrpt currently requires BF16, async ring attention, targeted transport, and shared-attention auto")
     if args.scheduler == "tetris" and not args.tetris_profile and not args.schedule:
         parser.error("--scheduler tetris requires --tetris-profile")
     if args.scheduler == "dynamic" and not args.dynamic_profile and not args.schedule:
@@ -391,12 +414,13 @@ def main():
         prefill_world = dist.get_world_size() - args.decode_gpus
         profile_gpu_names = (
             engine._all_objects(torch.cuda.get_device_name(local_rank))[:prefill_world]
-            if args.scheduler in ("tetris", "loongserve") and args.device == "cuda"
+            if args.scheduler in ("tetris", "loongserve", "spsrpt")
+            and args.device == "cuda"
             else None
         )
 
         profile_nodes = None
-        if args.scheduler in ("tetris", "loongserve"):
+        if args.scheduler in ("tetris", "loongserve", "spsrpt"):
             hosts = engine._all_objects(socket.gethostname())
             unique_hosts = list(dict.fromkeys(hosts))
             profile_nodes = [unique_hosts.index(host) for host in hosts]
@@ -437,12 +461,44 @@ def main():
                     json.loads(Path(args.dynamic_profile).read_text()),
                     **options,
                 )
-            elif args.scheduler in ("tetris", "loongserve"):
+            elif args.scheduler in ("tetris", "loongserve", "spsrpt"):
                 if args.scheduler == "tetris":
                     from sglang.srt.dynamic_sp.tetris import TetrisScheduler
 
                     policy = TetrisScheduler.from_file(
                         config, args.tetris_profile, args.tetris_chunk_solver
+                    )
+                elif args.scheduler == "spsrpt":
+                    from sglang.srt.dynamic_sp.spsrpt import SPSRPTScheduler
+
+                    if (
+                        not math.isfinite(args.spsrpt_migration_bandwidth)
+                        or args.spsrpt_migration_bandwidth <= 0
+                    ):
+                        raise ValueError(
+                            "SPSRPT migration bandwidth must be finite and positive"
+                        )
+                    kv_bytes = (
+                        model.num_layers
+                        * model.num_kv_heads
+                        * model.head_dim
+                        * 2
+                        * (4 if args.dtype == "float32" else 2)
+                    )
+                    from sglang.srt.dynamic_sp.roofline_profile import geometry
+
+                    roof_profile = json.loads(Path(args.spsrpt_profile).read_text())
+                    if roof_profile.get("geometry") != geometry(args.model_path):
+                        raise ValueError("Roofline profile model geometry does not match the loaded model")
+                    policy = SPSRPTScheduler.from_file(
+                        config,
+                        args.spsrpt_profile,
+                        args.spsrpt_quantum,
+                        prediction_relative_tolerance=args.spsrpt_prediction_tolerance,
+                        prediction_max_panels=args.spsrpt_prediction_max_panels,
+                        migration_seconds_per_token=kv_bytes
+                        / args.spsrpt_migration_bandwidth,
+                        migration_startup_seconds=args.spsrpt_migration_startup,
                     )
                 else:
                     from sglang.srt.dynamic_sp.loongserve import LoongServeScheduler
@@ -723,7 +779,8 @@ def main():
                     "seconds": elapsed,
                     "scheduling_seconds": scheduling_seconds,
                     "tetris_decision": scheduler.policy.last_decision
-                    if scheduler is not None and args.scheduler in ("tetris", "dynamic")
+                    if scheduler is not None
+                    and args.scheduler in ("tetris", "dynamic", "spsrpt")
                     else None,
                     "new_tokens": new_tokens,
                     "tokens_per_second": new_tokens / elapsed if new_tokens else None,
@@ -813,7 +870,7 @@ def main():
                                 else "replay",
                                 "scheduler_settings": {
                                     "tetris": scheduler.policy.metadata()
-                                    if args.scheduler in ("tetris", "dynamic")
+                                    if args.scheduler in ("tetris", "dynamic", "spsrpt")
                                     else None,
                                     "chunk_tokens": args.chunk_size,
                                     "max_running_requests": args.max_running_requests,

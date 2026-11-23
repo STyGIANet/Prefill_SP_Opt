@@ -234,6 +234,44 @@ def prepare_runtime_workload(engine, requests, args, *, baseline="DP"):
     return kept, report
 
 
+async def warmup(engine, requests, count, token_budget, replicas):
+    if not count:
+        return 0
+    if token_budget <= 0:
+        raise ValueError("warmup-tokens must be positive")
+    count = max(count, replicas)
+    longest = max(requests, key=lambda request: len(request["token_ids"]))["token_ids"]
+    # Two chunks worth of context, bounded by a request known to fit the runtime.
+    # Native radix reuse is disabled in both DP and LAPS benchmark settings.
+    sizes = sorted({min(len(longest), 1024), min(len(longest), 2 * token_budget)})
+    completed = 0
+
+    async def submit(index, size, repeat):
+        result = await engine.async_generate(
+            input_ids=longest[:size],
+            sampling_params={"temperature": 0, "max_new_tokens": 1, "ignore_eos": True},
+            rid=f"native-warmup-{repeat}-{size}-{index}",
+            routed_dp_rank=index % replicas,
+        )
+        if result.get("meta_info", {}).get("completion_tokens") != 1:
+            raise RuntimeError("Native warmup did not produce one token")
+
+    for repeat in range(2):
+        started = time.perf_counter()
+        for size in sizes:
+            # At most one resident warmup request per replica.
+            for begin in range(0, count, replicas):
+                batch = range(begin, min(begin + replicas, count))
+                await asyncio.gather(*(submit(index, size, repeat) for index in batch))
+                completed += len(batch)
+        print(
+            f"[dynamic-sp] native warmup pass={repeat + 1}/2 "
+            f"lengths={sizes} replicas={replicas} seconds={time.perf_counter() - started:.3f}",
+            flush=True,
+        )
+    return completed
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
@@ -250,7 +288,11 @@ def main():
     )
     parser.add_argument("--progress-interval", type=float, default=10.0)
     parser.add_argument("--progress-throughput-target", type=float, default=0.0)
+    parser.add_argument("--warmup-requests", type=int, default=0)
+    parser.add_argument("--warmup-tokens", type=int, default=8192)
     args = parser.parse_args()
+    if args.warmup_requests < 0 or args.warmup_tokens <= 0:
+        parser.error("Invalid warmup count or token budget")
     if any(
         not math.isfinite(v) or v < 0
         for v in (args.progress_interval, args.progress_throughput_target)
@@ -291,6 +333,13 @@ def main():
     engine = Engine(**settings)
     try:
         requests, capacity = prepare_runtime_workload(engine, requests, args)
+        warmed = engine.loop.run_until_complete(
+            warmup(
+                engine, requests, args.warmup_requests, args.warmup_tokens, args.dp_size
+            )
+        )
+        if warmed and not engine.flush_cache().success:
+            raise RuntimeError("Could not clear warmup KV before measurement")
         results = engine.loop.run_until_complete(
             benchmark(
                 engine,
@@ -299,6 +348,7 @@ def main():
                 progress_throughput_target=args.progress_throughput_target,
             )
         )
+        results["summary"].update(warmup_requests=warmed, verification_enabled=False)
         results["capacity_filter"] = capacity
         results["source_workload_sha256"] = capacity["source_workload_sha256"]
         results["engine_settings"] = settings

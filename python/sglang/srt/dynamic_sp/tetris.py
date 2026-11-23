@@ -169,6 +169,7 @@ class CDSPPlanner:
         initial=(),
         improvement_rate=0.0,
         feasible=None,
+        kv_capacity=None,
     ):
         if (
             type(length) is not int
@@ -191,6 +192,18 @@ class CDSPPlanner:
         ):
             raise ValueError("Invalid initial group")
         fits = feasible or (lambda ranks: True)
+        if kv_capacity is not None and (
+            len(kv_capacity) != len(queues)
+            or any(type(n) is not int or n < 0 for n in kv_capacity)
+        ):
+            raise ValueError("Expected nonnegative KV capacity per worker")
+
+        def end_limit(ranks):
+            # For cyclic ownership, rank at offset j owns ceil((end-j)/s)
+            # tokens. This is the exact largest endpoint fitting all owners.
+            return (min(kv_capacity[r] * len(ranks) + j
+                        for j, r in enumerate(ranks))
+                    if kv_capacity is not None else history + length)
 
         @lru_cache(None)
         def search(remaining, prefix, old, candidates, pool, cursor):
@@ -198,7 +211,8 @@ class CDSPPlanner:
             # Algorithm 2: sequential comparison with a strict improvement gate.
             for s in candidates:
                 ranks = self.group(pool, old, s, queues)
-                if ranks is None or not fits(ranks):
+                if (ranks is None or not fits(ranks)
+                        or prefix + remaining > end_limit(ranks)):
                     continue
                 start = max(cursor, max(queues[r] for r in ranks))
                 finish = start + self.models[s].seconds(prefix, remaining)
@@ -224,7 +238,9 @@ class CDSPPlanner:
                     start = max(cursor, max(queues[r] for r in ranks))
                     next_start = max(cursor, max(queues[r] for r in next_ranks))
                     count = self.models[current].tokens(
-                        prefix, next_start - start, remaining, self.chunk_solver
+                        prefix, next_start - start,
+                        min(remaining, max(0, end_limit(ranks) - prefix)),
+                        self.chunk_solver
                     )
                     # Tetris Implementation: "too short to yield benefits" (Alg. 1)
                     # applies to multi-instance groups; a single instance always
@@ -294,8 +310,8 @@ class ArrivalWindow:
 class TetrisScheduler:
     """Online prefill policy for synchronous or independent group execution.
 
-    Rebuild a FIFO virtual calendar from committed state and busy-worker
-    availability. Dispatch ready first chunks on disjoint groups. Predictions
+    Maintain FIFO reservations with per-plan peak KV admission bounds.
+    Dispatch ready chunks on disjoint groups. Predictions
     never count as actual progress; request/KV changes require successful commit.
     """
 
@@ -313,6 +329,7 @@ class TetrisScheduler:
         )
         self.window = ArrivalWindow(profile["arrival_window_seconds"], unit="requests")
         self.calendar = ReservationCalendar(config.world_size)
+        self.kv_reservations = {}
         self.update_interval = profile.get("threshold_update_seconds", 30.0)
         if not math.isfinite(self.update_interval) or self.update_interval <= 0:
             raise ValueError("Threshold update interval must be positive")
@@ -356,6 +373,7 @@ class TetrisScheduler:
             "profile_sha256": hashlib.sha256(canonical).hexdigest(),
             "chunk_solver": self.planner.chunk_solver,
             "execution": self.execution_mode,
+            "memory_policy": "per-plan-peak-kv-fifo-v1",
             "last_decision": self.last_decision,
         }
 
@@ -374,7 +392,11 @@ class TetrisScheduler:
         for rid in tuple(self.calendar.requests):
             if rid not in views:
                 self.calendar.retire(rid)
+                self.kv_reservations.pop(rid, None)
         decisions = []
+        reserved = [sum(peak[r] for peak in self.kv_reservations.values())
+                    for r in range(c.world_size)]
+        memory_wait = None
         # FIFO arrivals receive complete, persistent chunk reservations. Neither
         # resident priority nor per-dispatch token budgets change the paper plan.
         for request in sorted(state.requests, key=lambda r: r.submitted_at):
@@ -390,11 +412,27 @@ class TetrisScheduler:
                 len(request.prompt.token_ids),
                 [max(0.0, t - state.now) for t in available],
                 improvement_rate=rate,
+                kv_capacity=(c.max_local_tokens,) * c.world_size,
             )
             if chunks is None:
                 raise RuntimeError(
-                    "No Tetris plan exists for the profiled SP candidates"
+                    f"Tetris request {rid} ({len(request.prompt.token_ids)} tokens) "
+                    f"cannot fit the profiled SP degrees {tuple(self.models)} with "
+                    f"{c.max_local_tokens} KV tokens per worker, even in isolation"
                 )
+            peak = tuple(max(len(local_positions(chunk.history + chunk.length,
+                                                  chunk.ranks, rank))
+                             for chunk in chunks)
+                         for rank in range(c.world_size))
+            if any(used + needed > c.max_local_tokens
+                   for used, needed in zip(reserved, peak)):
+                # Do not append dependencies for a memory-blocked request.
+                # Earlier reservations can finish and release their KV without
+                # depending on this request. Preserve FIFO admission.
+                memory_wait = rid
+                break
+            self.kv_reservations[rid] = peak
+            reserved = [used + needed for used, needed in zip(reserved, peak)]
             self.calendar.reserve(rid, chunks, self.models, state.now)
             decisions.append(
                 {"request_id": rid, "chunks": [vars(chunk) for chunk in chunks]}
@@ -418,9 +456,7 @@ class TetrisScheduler:
             steps.append(PromptStep(task.request_id, task.ranks, task.end))
             if not request.ranks:
                 admit.append(request.prompt)
-        # Capacity is a feasibility check, never a silent policy modification.
-        # Insufficient memory must fail the experiment rather than substitute
-        # different degrees, chunks, or request priorities under Tetris's name.
+        # Retain a dispatch invariant in addition to admission reservations.
         placements = {
             r.prompt.request_id: (
                 r.ranks,
@@ -440,7 +476,7 @@ class TetrisScheduler:
                 > c.max_local_tokens
             ):
                 raise RuntimeError(
-                    "Tetris reserved plan exceeds KV capacity; increase max-local-tokens or reduce load. The baseline does not alter its plan for memory limits."
+                    "Tetris KV reservation invariant violated at dispatch"
                 )
         self.last_decision = {
             "version": state.version,
@@ -448,6 +484,8 @@ class TetrisScheduler:
             "improvement_rate": rate,
             "next_threshold_update": self.next_update,
             "plans": decisions,
+            "memory_wait_request": memory_wait,
+            "reserved_kv_tokens": reserved,
             "reservations": [
                 vars(t).copy()
                 for t in self.calendar.tasks.values()

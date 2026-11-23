@@ -13,6 +13,7 @@ from sglang.srt.dynamic_sp.dp_baseline import (
     benchmark,
     prepare_runtime_workload,
     read_workload,
+    warmup,
 )
 from sglang.srt.dynamic_sp.laps_released.routing import MiniLoadBalancerPolicy
 
@@ -131,29 +132,6 @@ class RoutedEngine:
             )
         finally:
             self.router.complete(category)
-
-
-async def warmup(engine, requests, count, token_budget, replicas):
-    if not count:
-        return 0
-    # Cover every replica, including replicas not currently receiving this class.
-    count = max(count, replicas)
-    if token_budget < count:
-        raise ValueError(
-            "warmup-tokens must cover at least one token per warmup request"
-        )
-    ordered = sorted(requests, key=lambda r: len(r["token_ids"]))
-    for i in range(count):
-        request = ordered[round(i * (len(ordered) - 1) / max(count - 1, 1))]
-        result = await engine.async_generate(
-            input_ids=request["token_ids"][: token_budget // count],
-            sampling_params={"temperature": 0, "max_new_tokens": 1, "ignore_eos": True},
-            rid=f"laps-warmup-{i}",
-            routed_dp_rank=i % replicas,
-        )
-        if result.get("meta_info", {}).get("completion_tokens") != 1:
-            raise RuntimeError("Native LAPS warmup did not produce one token")
-    return count
 
 
 def main():

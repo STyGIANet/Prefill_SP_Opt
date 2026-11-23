@@ -107,6 +107,14 @@ def main():
     parser.add_argument("--split", default="train")
     parser.add_argument("--text-column", default="text")
     parser.add_argument(
+        "--prompt-format", choices=("text", "longbench-v2"), default="text"
+    )
+    parser.add_argument(
+        "--truncate-tokens",
+        type=int,
+        help="Keep the first N tokens of the complete formatted prompt",
+    )
+    parser.add_argument(
         "--num-prompts",
         default="all",
         help="all (default) or a positive count of eligible records",
@@ -153,8 +161,31 @@ def main():
         type=int,
         help="Exclude whole records above this capacity; never truncate",
     )
+    parser.add_argument(
+        "--target-total-tokens",
+        type=int,
+        help="Stop after reaching this token budget with complete records",
+    )
+    parser.add_argument(
+        "--max-source-rows",
+        type=int,
+        help="Bound source scanning; num-prompts becomes an upper bound",
+    )
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
+    if args.truncate_tokens is not None and args.truncate_tokens <= 0:
+        parser.error("truncate-tokens must be positive")
+    if (args.truncate_tokens is not None or args.prompt_format != "text") and (
+        args.input_tokens != "all" or args.length_mode != "natural"
+    ):
+        parser.error(
+            "Formatted prompts and truncate-tokens require natural lengths and input-tokens all"
+        )
+    if any(
+        v is not None and v <= 0
+        for v in (args.target_total_tokens, args.max_source_rows)
+    ):
+        parser.error("Token budget and source row limit must be positive")
     if args.max_prompt_tokens is not None and args.max_prompt_tokens <= 0:
         parser.error("max-prompt-tokens must be positive")
     if args.num_prompts == "all":
@@ -229,6 +260,11 @@ def main():
         and args.input_tokens > config.max_position_embeddings
     ):
         raise ValueError("input-tokens exceeds the model context length")
+    if (
+        args.truncate_tokens is not None
+        and args.truncate_tokens > config.max_position_embeddings
+    ):
+        raise ValueError("truncate-tokens exceeds the model context length")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
     local_dataset = Path(args.dataset).expanduser()
     if local_dataset.is_file():
@@ -254,31 +290,77 @@ def main():
     if needed is not None and needed <= 0:
         raise ValueError("input-tokens must leave room for text after BOS")
     rows_read = 0
+    total_tokens = 0
+    truncated_rows = []
     for row_index, row in rows:
-        rows_read = row_index + 1
-        text = record_text(row[args.text_column])
+        if args.max_source_rows is not None and rows_read >= args.max_source_rows:
+            break
+        rows_read += 1
+        if args.prompt_format == "longbench-v2":
+            text = (
+                "Please read the following text and answer the question below.\n\n"
+                + row["context"]
+                + "\n\nQuestion: "
+                + row["question"]
+                + "\n"
+                + "\n".join(f"{letter}. {row['choice_' + letter]}" for letter in "ABCD")
+                + "\nAnswer with the letter of the correct option."
+            )
+        else:
+            text = record_text(row[args.text_column])
         if not isinstance(text, str):
             raise TypeError("The dataset text column must contain strings")
         if not text.strip():
             continue
-        tokens = encode_record(tokenizer, text, needed)
-        if not tokens or (args.length_mode == "fixed" and len(tokens) < needed):
-            continue
-        if len(tokens) + len(bos) > min(
+        if args.prompt_format == "longbench-v2":
+            # Render first: chat-template tokenization may return a BatchEncoding
+            # whose slicing exposes backend Encoding objects instead of token IDs.
+            rendered = tokenizer.apply_chat_template(
+                [{"role": "user", "content": text}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            # The rendered template already includes BOS and role delimiters.
+            prompt = encode_record(tokenizer, rendered, limit=None)
+        else:
+            tokens = encode_record(tokenizer, text, needed)
+            if not tokens or (args.length_mode == "fixed" and len(tokens) < needed):
+                continue
+            prompt = bos + tokens
+        if not isinstance(prompt, list) or any(
+            type(token) is not int for token in prompt
+        ):
+            raise TypeError(
+                f"Source row {row_index}: tokenizer must return a flat list of integer token IDs"
+            )
+        original_tokens = len(prompt)
+        if args.truncate_tokens is not None:
+            prompt = prompt[: args.truncate_tokens]
+        if len(prompt) > min(
             config.max_position_embeddings,
             args.max_prompt_tokens or config.max_position_embeddings,
         ):
             excluded_rows.append(
                 {
                     "row_index": row_index,
-                    "input_tokens": len(tokens) + len(bos),
+                    "input_tokens": len(prompt),
                     "reason": "exceeds_model_context"
-                    if len(tokens) + len(bos) > config.max_position_embeddings
+                    if len(prompt) > config.max_position_embeddings
                     else "exceeds_instance_capacity",
                 }
             )
             continue
-        prompts.append(bos + tokens)
+        if original_tokens > len(prompt):
+            truncated_rows.append(
+                {
+                    "row_index": row_index,
+                    "original_tokens": original_tokens,
+                    "input_tokens": len(prompt),
+                    "removed_tokens": original_tokens - len(prompt),
+                }
+            )
+        prompts.append(prompt)
+        total_tokens += len(prompts[-1])
         if args.arrival_pattern == "trace":
             timestamps.append(
                 datetime.fromisoformat(row[args.timestamp_column]).timestamp()
@@ -287,14 +369,24 @@ def main():
             {
                 "row_index": row_index,
                 "title": row.get("short_book_title"),
+                "original_tokens": original_tokens,
+                "input_tokens": len(prompt),
                 "url": row.get("url"),
             }
         )
-        if len(prompts) == args.num_prompts:
+        if len(prompts) == args.num_prompts or (
+            args.target_total_tokens is not None
+            and total_tokens >= args.target_total_tokens
+        ):
             break
     if not prompts:
         raise ValueError("Dataset yielded no eligible prompts")
-    if args.num_prompts is not None and len(prompts) != args.num_prompts:
+    if (
+        args.num_prompts is not None
+        and len(prompts) != args.num_prompts
+        and args.target_total_tokens is None
+        and args.max_source_rows is None
+    ):
         raise ValueError(f"Dataset yielded only {len(prompts)} eligible prompts")
     mean_prompt_tokens = sum(map(len, prompts)) / len(prompts)
     request_rate = request_rate_for_token_load(map(len, prompts), args.offered_load)
@@ -332,6 +424,16 @@ def main():
         "split": args.split,
         "text_column": args.text_column,
         "rows_read": rows_read,
+        "target_total_tokens": args.target_total_tokens,
+        "max_source_rows": args.max_source_rows,
+        "total_input_tokens": total_tokens,
+        "selection": "Source-order prefix of eligible records",
+        "prompt_format": args.prompt_format,
+        "truncate_tokens": args.truncate_tokens,
+        "truncation_side": "right" if args.truncate_tokens else None,
+        "truncated_records": len(truncated_rows),
+        "truncated_tokens": sum(row["removed_tokens"] for row in truncated_rows),
+        "truncated_rows": truncated_rows,
         "source_rows": source_rows,
         "excluded_rows": excluded_rows,
         "excluded_context_records": sum(
@@ -366,12 +468,18 @@ def main():
         "trace_span_seconds": max(timestamps) - min(timestamps) if timestamps else None,
         "last_arrival_seconds": max(arrival_times),
         "construction": (
-            "One record per prompt; BOS per prompt; "
+            (
+                "Context, question and choices with chat template; "
+                if args.prompt_format == "longbench-v2"
+                else "One record per prompt; BOS per prompt; "
+            )
             + (
                 "rows shorter than the requested length are skipped"
                 if args.length_mode == "fixed"
                 else (
-                    "full records without truncation; empty token sequences skipped"
+                    f"formatted prompt prefix capped at {args.truncate_tokens} tokens"
+                    if args.truncate_tokens is not None
+                    else "full records without truncation; empty token sequences skipped"
                     if args.input_tokens is None
                     else "natural lengths retained up to input_tokens; empty token sequences skipped"
                 )

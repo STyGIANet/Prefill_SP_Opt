@@ -28,7 +28,8 @@ from sglang.srt.dynamic_sp.decode import (
     send_rows,
 )
 from sglang.srt.dynamic_sp.engine import DynamicSPPrefillEngine, PlanRejected, _State
-from sglang.srt.dynamic_sp.plan import PrefillPlan, PromptStep
+from sglang.srt.dynamic_sp.plan import PrefillPlan, Prompt, PromptStep
+from sglang.srt.dynamic_sp.warmup import ContextWarmup
 from sglang.srt.utils.monotonic_clock import monotonic_clock_domain
 
 
@@ -169,6 +170,8 @@ class GroupWorker:
             torch.cuda.synchronize(device)
 
     def run(self, operation):
+        if isinstance(operation, ContextWarmup):
+            return self.context_warmup(operation)
         if isinstance(operation, KVTransfer):
             return self.transfer(operation)
         if isinstance(operation, DecodeStep):
@@ -215,6 +218,110 @@ class GroupWorker:
         else:
             self.decode.receive(operation, communication)
         return operation_response(operation, self.rank, started)
+
+    @torch.inference_mode()
+    def context_warmup(self, operation):
+        if self.states or (self.decode is not None and self.decode.sequences):
+            raise RuntimeError("Context warmup requires empty request state")
+        self.kv_pool.assert_empty()
+        engine = self.engine(operation)
+        engine.version = 0
+        engine._states = {}
+        degree = len(operation.members)
+        history, chunk = operation.history, operation.chunk
+        if (history < 1 or chunk < 1 or history + chunk > self.model.context_length
+                or (history + chunk + degree - 1) // degree > self.options["max_local_tokens"]):
+            raise ValueError("Context warmup exceeds KV or model capacity")
+        started = time.perf_counter()
+        before = torch.cuda.memory_stats(self.model.device)
+        if engine.attention_backend == "ring":
+            return self._warm_ring_context(operation, engine, started, before)
+        prompt = Prompt("context-warmup", (1,) * (history + chunk))
+        ranks = tuple(range(degree))
+        self.kv_pool.begin()
+        try:
+            def seed():
+                count = max(0, (history - 1 - engine.rank) // degree + 1)
+                kv = self.kv_pool.allocate(count)
+                for layer in range(self.model.num_layers):
+                    self.kv_pool.native.get_key_buffer(layer).index_fill_(0, kv.indices, 0)
+                    self.kv_pool.native.get_value_buffer(layer).index_fill_(0, kv.indices, 0)
+                return {prompt.request_id: _State(prompt, ranks, history, kv)}
+            engine._states = engine._checked("seed warmup KV", seed)
+            self.kv_pool.commit({}, engine._states)
+            plan = PrefillPlan(0, (PromptStep(prompt.request_id, ranks, history + chunk),))
+            engine.execute(plan if engine.rank == 0 else None)
+            metrics = dict(engine.metrics)
+            release = PrefillPlan(engine.version, release=(prompt.request_id,))
+            engine.execute(release if engine.rank == 0 else None)
+            engine._complete_device_work()
+            self.kv_pool.assert_empty()
+            after = torch.cuda.memory_stats(self.model.device)
+            if any(after.get(key, 0) != before.get(key, 0)
+                   for key in ("num_alloc_retries", "num_ooms")):
+                raise RuntimeError("Allocator retry/OOM in long-context warmup")
+            ready = time.perf_counter()
+            return {"ticket": operation.ticket, "rank": self.rank, "status": "committed",
+                    "started_at": started, "ready_at": ready, "seconds": ready - started,
+                    "metrics": metrics, "errors": {}, "output_ids": {}}
+        finally:
+            if self.kv_pool.allocated is not None and not engine._failed:
+                engine._complete_device_work()
+                self.kv_pool.rollback()
+
+    def _warm_ring_context(self, operation, engine, started, before):
+        from types import SimpleNamespace
+        from sglang.srt.dynamic_sp.ring import RingWorkspace
+
+        m = self.model
+        degree = len(operation.members)
+        total = operation.history + operation.chunk
+        count = len(range(engine.rank, total, degree))
+        prefix = len(range(engine.rank, operation.history, degree))
+        workspace = None
+        engine.metrics = {"fused_attention_calls": 0, "migration_collectives": 0}
+        self.kv_pool.begin()
+        try:
+            def seed():
+                kv = self.kv_pool.allocate(count)
+                # Attention layouts are shared across layers. Prefix values are
+                # synthetic; no prefix forward pass is needed for kernel warmup.
+                self.kv_pool.native.get_key_buffer(0).index_fill_(0, kv.indices, 0)
+                self.kv_pool.native.get_value_buffer(0).index_fill_(0, kv.indices, 0)
+                query = torch.zeros((count - prefix, m.num_heads, m.head_dim),
+                                    device=m.device, dtype=m.dtype)
+                positions = (torch.arange(count - prefix, device=m.device) * degree
+                             + prefix * degree + engine.rank)
+                state = SimpleNamespace(end=total, ranks=tuple(range(degree)), kv=kv)
+                return query, positions, [(state, prefix, 0, count - prefix)]
+
+            query, positions, layouts = engine._checked("warmup KV allocation", seed)
+            if not engine._ring_initialized:
+                token = engine._checked("warmup transport allocation",
+                    lambda: torch.zeros(1, device=m.device, dtype=m.dtype))
+                engine.communication.data.allreduce([token]).wait()
+                engine._ring_initialized = True
+            workspace = engine._checked("warmup ring workspace",
+                                        lambda: RingWorkspace(engine, layouts))
+            accumulators = engine._checked("warmup ring preparation",
+                lambda: workspace.prepare(0, query, positions, layouts))
+            workspace.attention(query, layouts, accumulators)
+            workspace.drain()
+            engine._complete_device_work()
+            after = torch.cuda.memory_stats(m.device)
+            if any(after.get(key, 0) != before.get(key, 0)
+                   for key in ("num_alloc_retries", "num_ooms")):
+                raise RuntimeError("Allocator retry/OOM in long-context warmup")
+            ready = time.perf_counter()
+            return {"ticket": operation.ticket, "rank": self.rank, "status": "committed",
+                    "started_at": started, "ready_at": ready, "seconds": ready - started,
+                    "metrics": dict(engine.metrics), "errors": {}, "output_ids": {}}
+        finally:
+            if workspace is not None:
+                workspace.drain()
+            engine._complete_device_work()
+            self.kv_pool.rollback()
+            self.kv_pool.assert_empty()
 
     @torch.inference_mode()
     def execute(self, operation):
