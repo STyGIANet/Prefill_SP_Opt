@@ -9,9 +9,11 @@ import re
 import shutil
 from pathlib import Path
 
-_INSTALLED_HEADER_SHA256 = (
-    "ad8be30492fb04131edc25b539ae77e911177af8647c7e2007cf172a4a69d029"
-)
+# Reviewed FA2 tile bounds, including the multiline multi-item bound.
+_REVIEWED_HEADERS = {
+    "ad8be30492fb04131edc25b539ae77e911177af8647c7e2007cf172a4a69d029": 9,  # 0.7.2
+    "30b27d0b237ee155e25990b11893d5a5b026c86e7f02cf476d6ab5c621d22f72": 9,  # 0.7.4
+}
 _configured = False
 
 
@@ -32,25 +34,25 @@ def configure():
     relative = Path("flashinfer/attention/prefill.cuh")
     source = (original_include / relative).read_text()
     source_hash = hashlib.sha256(source.encode()).hexdigest()
-    if source_hash != _INSTALLED_HEADER_SHA256:
+    if source_hash not in _REVIEWED_HEADERS:
         raise RuntimeError(
             "LAPS FlashInfer header differs from the current-environment adapter; "
             "review the padded causal bounds before using this version"
         )
-    # Both prefill implementations and both tile boundaries have this form.
+    # Saturate causal iteration bounds in single, ragged, and paged prefill.
     term = r"ceil_div\([^;\n]*?group_size\)"
-    selected = re.sub(
-        rf"kv_len - qo_len \+ ({term})",
+    selected, first_count = re.subn(
+        rf"kv_len - qo_len\s*\+\s*({term})",
         r"sub_if_greater_or_zero(kv_len + \1, qo_len)",
         source,
     )
-    selected = re.sub(
+    selected, second_count = re.subn(
         rf"kv_len \+ ({term}) - qo_len",
         r"sub_if_greater_or_zero(kv_len + \1, qo_len)",
         selected,
     )
-    if selected == source:
-        raise RuntimeError("LAPS causal-bound adaptation matched no expressions")
+    if first_count + second_count != _REVIEWED_HEADERS[source_hash]:
+        raise RuntimeError("LAPS causal-bound adaptation matched an unexpected number of expressions")
     digest = hashlib.sha256(selected.encode()).hexdigest()
     root = Path(__file__).resolve().parents[1] / "work" / "laps-flashinfer" / digest
     root.mkdir(parents=True, exist_ok=True)

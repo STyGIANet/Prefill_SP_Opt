@@ -30,8 +30,8 @@ DATASETS["longbench"] = (
 ROOT = Path(__file__).resolve().parents[4]
 WORK = ROOT / "python/sglang/srt/dynamic_sp/work"
 SCHEDULERS = {
-    "tetris": "tetris",
     "laps": "laps",
+    "tetris": "tetris",
     "loongserve": "loongserve",
     "ours": "dynamic",
     "spsrpt": "spsrpt",

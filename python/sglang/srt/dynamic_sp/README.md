@@ -68,7 +68,7 @@ do not capture every placement or concurrent communication pattern.
 From the repository root:
 
 ```bash
-./run_prefill_experiments.sh --suite pilot --datasets pg19 --schedulers tetris laps spsrpt --offered-load 25000 --spsrpt-quantum 1.0 --short-threshold 8192
+./run_prefill_experiments.sh --suite pilot --datasets pg19 --schedulers laps tetris spsrpt --offered-load 25000 --spsrpt-quantum 1.0 --short-threshold 8192
 ```
 
 The model is `gradientai/Llama-3-8B-Instruct-Gradient-1048k`. The pilot selects at

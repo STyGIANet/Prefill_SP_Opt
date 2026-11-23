@@ -11,8 +11,8 @@
 #    - LAPS and native DP: no fitted latency profile. The "ours" label uses
 #      the dynamic scheduler with the Tetris latency profile.
 # 3. For each dataset and repetition, run schedulers in --schedulers order.
-#    With --schedulers tetris laps spsrpt, the first repetition runs:
-#      Tetris -> LAPS -> SPSRPT.
+#    With --schedulers laps tetris spsrpt, the first repetition runs:
+#      LAPS -> Tetris -> SPSRPT.
 #    Order rotates between repetitions; profiles remain fixed throughout.
 # 4. Each trial starts a fresh runtime, loads the model, initializes execution
 #    resources, warms up, clears warmup KV, and then submits measured arrivals.
