@@ -415,7 +415,7 @@ def check_server_args(server_args: Any):
     if cfg.enable_laps_scheduler:
         if cfg.laps_length_threshold <= 0:
             raise ValueError("laps_length_threshold must be positive")
-        if cfg.pp_size != 1 or cfg.enable_dp_attention:
+        if cfg.pp_size != 1 or cfg.attn_dp_size > 1:
             raise ValueError("LAPS requires independent serving replicas and pp_size=1")
         if cfg.schedule_policy != "fcfs" or cfg.enable_priority_scheduling:
             raise ValueError("Released LAPS uses FCFS within its short/long queues")
