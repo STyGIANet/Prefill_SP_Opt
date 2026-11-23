@@ -4615,6 +4615,7 @@ class Scheduler(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
+        admission_queue: Optional[List[Req]] = None,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
         self.prefill_admission_no_token = False
         # Check if the grammar is ready in the grammar queue
@@ -4622,6 +4623,14 @@ class Scheduler(
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
+
+        # Selection does not transfer ownership: native callbacks and request
+        # registries retain the original waiting queue throughout admission.
+        waiting_queue = (
+            self.waiting_queue
+            if admission_queue is None
+            else [r for r in admission_queue if r.owner_list is self.waiting_queue]
+        )
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -4632,7 +4641,7 @@ class Scheduler(
             running_batch.batch_is_full = False
 
         if (
-            running_batch.batch_is_full or len(self.waiting_queue) == 0
+            running_batch.batch_is_full or len(waiting_queue) == 0
         ) and self.chunked_req is None:
             return None, running_batch
 
@@ -4655,7 +4664,7 @@ class Scheduler(
         )
         if running_bs == 0 and self.chunked_req is None and num_allocatable_reqs <= 0:
             if self.get_prefill_adder_class().release_request_slot(
-                self.tree_cache, self.waiting_queue
+                self.tree_cache, waiting_queue
             ):
                 num_allocatable_reqs = self.get_num_allocatable_reqs(
                     running_bs, running_batch=running_batch
@@ -4674,21 +4683,27 @@ class Scheduler(
 
         # After the early returns, so a full-batch pass does not scan the queue.
         self._ack_waiting_health_checks()
+        if admission_queue is not None:
+            waiting_queue[:] = [
+                r for r in waiting_queue if r.owner_list is self.waiting_queue
+            ]
         # Get priority queue
-        self.policy.poll_storage_prefetches(self.waiting_queue)
-        self.waiting_queue.reorder(
-            self.policy.calc_priority(
-                self.waiting_queue,
-                running_batch,
-                processed_tokens=self.processed_tokens_counter,
-                bootstrap_queue=(
-                    self.disagg_prefill_bootstrap_queue.queue
-                    if self.disagg_prefill_bootstrap_queue is not None
-                    else []
-                ),
-                chunked_req=self.chunked_req,
-            )
+        self.policy.poll_storage_prefetches(waiting_queue)
+        ordered = self.policy.calc_priority(
+            waiting_queue,
+            running_batch,
+            processed_tokens=self.processed_tokens_counter,
+            bootstrap_queue=(
+                self.disagg_prefill_bootstrap_queue.queue
+                if self.disagg_prefill_bootstrap_queue is not None
+                else []
+            ),
+            chunked_req=self.chunked_req,
         )
+        if admission_queue is None:
+            waiting_queue.reorder(ordered)
+        else:
+            waiting_queue[:] = ordered
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -4737,7 +4752,7 @@ class Scheduler(
             prefill_max_requests=get_schedule().prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
-            waiting_queue_len=len(self.waiting_queue),
+            waiting_queue_len=len(waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
             request_retirer=self.request_retirer,
             kv_awaiting_transfer=bool(self.disagg_prefill_transfer_queue),
@@ -4749,7 +4764,7 @@ class Scheduler(
             resumed_req.init_next_round_input()
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
                 resumed_req,
-                self.waiting_queue,
+                waiting_queue,
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
                 processed_tokens=self.processed_tokens_counter,
@@ -4770,7 +4785,7 @@ class Scheduler(
             if self.lora_drainer:
                 lora_manager = self.tp_worker.model_runner.lora_manager
                 self.lora_drainer.update_draining_state(
-                    self.waiting_queue,
+                    waiting_queue,
                     [*running_reqs, *adder.can_run_list],
                     pinned_loras=(
                         {
@@ -4785,7 +4800,7 @@ class Scheduler(
 
         mamba_allocator = self.token_to_kv_pool_allocator.state_slots
         if mamba_allocator is not None:
-            mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+            mamba_allocator.alloc_group_begin(len(waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # A parked chunk found no budget in this pass: admit no one ahead of it,
         # so no batch carries a chunked request it does not run.
@@ -4804,9 +4819,9 @@ class Scheduler(
         # Get requests from the waiting queue to a new prefill batch
         bounded_active = self.policy._bounded_active
         candidates = (
-            self.policy.admission_candidates(self.waiting_queue)
+            self.policy.admission_candidates(waiting_queue)
             if bounded_active
-            else self.waiting_queue
+            else waiting_queue
         )
         for req in candidates:
             if bounded_active and not self.policy.allows_admission(req):

@@ -15,19 +15,16 @@ class _Admission(PrefillPolicy):
         self._laps_short_queue, self._laps_long_queue = [], []
         self._laps_classify_requests(scheduler.waiting_queue)
 
-    @property
-    def waiting_queue(self):
-        return self.scheduler.waiting_queue
-
-    @waiting_queue.setter
-    def waiting_queue(self, value):
-        self.scheduler.waiting_queue = value
-
-    def get_new_batch_prefill(self):
+    def _build_batch_from_queue(self, queue):
         batch, self.running_batch = self.scheduler._get_new_batch_prefill_raw(
             prefill_delayer_single_pass=self.delayer,
             running_batch=self.running_batch,
+            admission_queue=queue,
         )
+        # Admission transfers ownership through the native move/retire paths.
+        queue[:] = [
+            req for req in queue if req.owner_list is self.scheduler.waiting_queue
+        ]
         return batch
 
     def process_prefill_chunk(self):
@@ -45,18 +42,9 @@ def build_laps_prefill(scheduler, running_batch, prefill_delayer_single_pass):
         for req in scheduler.grammar_manager.get_ready_grammar_requests():
             scheduler._add_request_to_queue(req)
     admission = _Admission(scheduler, running_batch, prefill_delayer_single_pass)
-    try:
-        batch = admission._get_next_laps_batch_to_run()
-        # Native chunk ownership survives removal from waiting_queue. Continue
-        # that resident request even when no new request is waiting to enter.
-        if batch is None and scheduler.chunked_req is not None:
-            remaining = admission._laps_short_queue + admission._laps_long_queue
-            batch = admission._build_batch_from_queue(remaining)
-            admission._laps_short_queue.clear()
-            admission._laps_long_queue.clear()
-            admission._laps_classify_requests(remaining)
-    finally:
-        scheduler.waiting_queue = (
-            admission._laps_short_queue + admission._laps_long_queue
-        )
+    batch = admission._get_next_laps_batch_to_run()
+    # Continue a resident chunk even when no new request is waiting.
+    if batch is None and scheduler.chunked_req is not None:
+        remaining = admission._laps_short_queue + admission._laps_long_queue
+        batch = admission._build_batch_from_queue(remaining)
     return batch, admission.running_batch
