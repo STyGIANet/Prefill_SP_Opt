@@ -68,7 +68,7 @@ def ForwardBatch(**kwargs):
         )
     backend = batch.attn_backend
     native = getattr(backend, "native", backend)
-    native.kv_index_translator.bind_runner_slots(batch)
+    native.runner_ids.bind_runner_slots(batch)
     batch.attn_tp_sequence_sharded = False
     return batch
 
@@ -108,7 +108,7 @@ class AttentionAdapter:
         key = bs, seq_len
         if seq_lens_cpu is None:
             seq_lens_cpu = seq_lens.cpu()
-        plan = native.kv_index_translator.plan(
+        plan = native.runner_ids.plan(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
